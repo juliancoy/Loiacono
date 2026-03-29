@@ -104,15 +104,17 @@ button.active { background: #1a4a2a; border-color: #2a5a3a; color: #a0ffc0; }
 }
 
 .freq-labels-y {
-    display: flex;
-    flex-direction: column-reverse;
-    justify-content: space-between;
+    position: relative;
     font-size: 0.65rem;
     color: #505070;
-    padding: 2px 0;
-    width: 50px;
+    width: 40px;
     text-align: right;
     height: 400px;
+}
+
+.freq-labels-y span {
+    white-space: nowrap;
+    padding-right: 6px;
 }
 
 canvas {

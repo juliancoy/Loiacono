@@ -1,5 +1,5 @@
 // Loiacono Transform — WebGPU Live Spectrogram (horizontal)
-// Time scrolls left-to-right, frequency on Y axis
+// Time scrolls left-to-right, frequency on Y axis (log scale)
 
 // ─── Inline WGSL Shader ─────────────────────────────────────────
 const LOIACONO_WGSL = /* wgsl */`
@@ -71,19 +71,25 @@ fn main(
 // ─── Settings (live-adjustable) ──────────────────────────────────
 const SAMPLE_RATE = 48000;
 const SIGNAL_LENGTH = 1 << 15;
-const SPECTROGRAM_WIDTH = 800;  // time axis (pixels = frames of history)
+const SPECTROGRAM_WIDTH = 800;
+const DISPLAY_HEIGHT = 400;
 
 let multiple = 40;
 let freqMin = 100;
 let freqMax = 3000;
-let freqStep = 5;
+let freqBins = 200;
 let fprime = [];
 let numFreq = 0;
 
+// Build log-spaced frequency bins
 function rebuildFreqs() {
     fprime = [];
-    for (let f = freqMin / SAMPLE_RATE; f < freqMax / SAMPLE_RATE; f += freqStep / SAMPLE_RATE) {
-        fprime.push(f);
+    const logMin = Math.log(freqMin);
+    const logMax = Math.log(freqMax);
+    const logStep = (logMax - logMin) / freqBins;
+    for (let i = 0; i < freqBins; i++) {
+        const f = Math.exp(logMin + i * logStep);
+        fprime.push(f / SAMPLE_RATE);
     }
     numFreq = fprime.length;
     resizeCanvas();
@@ -99,16 +105,14 @@ const errorEl = document.getElementById("error");
 
 const multipleSlider = document.getElementById("multipleSlider");
 const multipleVal = document.getElementById("multipleVal");
+const freqBinsSlider = document.getElementById("freqBinsSlider");
+const freqBinsVal = document.getElementById("freqBinsVal");
 const freqMinSlider = document.getElementById("freqMinSlider");
 const freqMinVal = document.getElementById("freqMinVal");
 const freqMaxSlider = document.getElementById("freqMaxSlider");
 const freqMaxVal = document.getElementById("freqMaxVal");
-const freqStepSlider = document.getElementById("freqStepSlider");
-const freqStepVal = document.getElementById("freqStepVal");
 
 let ctx2d;
-
-const DISPLAY_HEIGHT = 400; // fixed CSS display height
 
 function resizeCanvas() {
     canvas.width = SPECTROGRAM_WIDTH;
@@ -116,18 +120,30 @@ function resizeCanvas() {
     canvas.style.width = `${SPECTROGRAM_WIDTH}px`;
     canvas.style.height = `${DISPLAY_HEIGHT}px`;
     ctx2d = canvas.getContext("2d");
-    ctx2d.fillStyle = "#0a0a0f";
+    ctx2d.fillStyle = "#000";
     ctx2d.fillRect(0, 0, canvas.width, canvas.height);
 }
 
 function updateFreqLabels() {
     const container = document.getElementById("freqLabelsY");
     container.innerHTML = "";
-    const labelCount = 7;
-    for (let i = 0; i < labelCount; i++) {
-        const f = freqMin + (freqMax - freqMin) * (i / (labelCount - 1));
+    // Log-spaced labels
+    const labelFreqs = [100, 200, 500, 1000, 2000, 5000, 10000].filter(f => f >= freqMin && f <= freqMax);
+    if (labelFreqs.length < 2) {
+        // Fallback: linear labels
+        for (let i = 0; i < 5; i++) {
+            const f = freqMin + (freqMax - freqMin) * (i / 4);
+            labelFreqs.push(Math.round(f));
+        }
+    }
+    for (const f of labelFreqs) {
         const span = document.createElement("span");
-        span.textContent = `${Math.round(f)} Hz`;
+        span.textContent = f >= 1000 ? `${(f/1000).toFixed(1)}k` : `${f}`;
+        // Position based on log scale
+        const logPos = (Math.log(f) - Math.log(freqMin)) / (Math.log(freqMax) - Math.log(freqMin));
+        span.style.position = "absolute";
+        span.style.bottom = `${logPos * 100}%`;
+        span.style.transform = "translateY(50%)";
         container.appendChild(span);
     }
 }
@@ -143,15 +159,15 @@ let isRunning = false;
 let testOscillator = null;
 let maxAmplitude = 1.0;
 let frameCount = 0;
+let lastFrameTime = 0;
+let fps = 0;
 
 // ─── Colormap ────────────────────────────────────────────────────
 function hotColor(t) {
     t = Math.max(0, Math.min(1, t));
-    // Apply gamma to boost visibility of mid-range values
     t = Math.pow(t, 0.6);
     let r, g, b;
     if (t < 0.05) {
-        // True black for noise floor
         r = 0; g = 0; b = 0;
     } else if (t < 0.2) {
         const s = (t - 0.05) / 0.15;
@@ -186,7 +202,7 @@ async function initWebGPU() {
     testBtn.disabled = false;
 }
 
-// ─── Spectrogram Drawing (horizontal: time on X, freq on Y) ─────
+// ─── Spectrogram Drawing ─────────────────────────────────────────
 function drawSpectrogramColumn(spectrum) {
     // Scroll existing image left by 1 pixel
     const imageData = ctx2d.getImageData(1, 0, canvas.width - 1, canvas.height);
@@ -204,11 +220,10 @@ function drawSpectrogramColumn(spectrum) {
     }
     maxAmplitude = Math.max(maxAmplitude, 0.1);
 
-    // Draw new rightmost column (freq bins bottom-to-top = low freq at bottom)
+    // Draw new rightmost column (low freq at bottom)
     const col = ctx2d.createImageData(1, canvas.height);
     const logMax = Math.log(1 + maxAmplitude);
     for (let i = 0; i < numFreq && i < canvas.height; i++) {
-        // Map frequency index: low freq at bottom (canvas row = height-1-i)
         const canvasRow = canvas.height - 1 - i;
         const normalized = Math.log(1 + spectrum[i]) / logMax;
         const [r, g, b, a] = hotColor(normalized);
@@ -300,22 +315,31 @@ function cpuLoiacono(signal, freqs, mult, signalLen) {
     return spectrum;
 }
 
-// ─── Frame Loop ──────────────────────────────────────────────────
+// ─── Frame Loop (full speed) ─────────────────────────────────────
 function runLoop() {
     if (!isRunning) return;
 
     try {
+        const t0 = performance.now();
         const spectrum = cpuLoiacono(ringBuffer, fprime, multiple, SIGNAL_LENGTH);
+        const computeMs = performance.now() - t0;
 
         drawSpectrogramColumn(spectrum);
         frameCount++;
-        if (frameCount % 10 === 0) {
+
+        // FPS tracking
+        const now = performance.now();
+        if (now - lastFrameTime > 500) {
+            fps = Math.round(frameCount / ((now - lastFrameTime) / 1000));
+            frameCount = 0;
+            lastFrameTime = now;
+
             let peak = 0, peakIdx = 0;
             for (let i = 0; i < spectrum.length; i++) {
                 if (spectrum[i] > peak) { peak = spectrum[i]; peakIdx = i; }
             }
             const peakFreq = (fprime[peakIdx] * SAMPLE_RATE).toFixed(0);
-            statusEl.textContent = `Peak: ${peakFreq} Hz | Amp: ${peak.toFixed(1)} | Bins: ${numFreq} | Multiple: ${multiple} | Frame: ${frameCount}`;
+            statusEl.textContent = `Peak: ${peakFreq} Hz | ${fps} fps | ${computeMs.toFixed(1)}ms/frame | ${numFreq} bins`;
         }
     } catch (e) {
         statusEl.textContent = "Error: " + e.message;
@@ -323,13 +347,19 @@ function runLoop() {
         return;
     }
 
-    setTimeout(runLoop, 50);
+    requestAnimationFrame(runLoop);
 }
 
 // ─── Settings Handlers ───────────────────────────────────────────
 multipleSlider.addEventListener("input", () => {
     multiple = parseInt(multipleSlider.value);
     multipleVal.textContent = multiple;
+});
+
+freqBinsSlider.addEventListener("input", () => {
+    freqBins = parseInt(freqBinsSlider.value);
+    freqBinsVal.textContent = freqBins;
+    rebuildFreqs();
 });
 
 freqMinSlider.addEventListener("input", () => {
@@ -354,12 +384,6 @@ freqMaxSlider.addEventListener("input", () => {
     rebuildFreqs();
 });
 
-freqStepSlider.addEventListener("input", () => {
-    freqStep = parseInt(freqStepSlider.value);
-    freqStepVal.textContent = freqStep;
-    rebuildFreqs();
-});
-
 // ─── UI Handlers ─────────────────────────────────────────────────
 startBtn.addEventListener("click", async () => {
     if (isRunning && !testOscillator) {
@@ -380,6 +404,8 @@ startBtn.addEventListener("click", async () => {
         }
         await startAudio();
         isRunning = true;
+        lastFrameTime = performance.now();
+        frameCount = 0;
         startBtn.textContent = "Stop";
         startBtn.classList.add("active");
         statusEl.textContent = "Listening...";
@@ -401,6 +427,8 @@ testBtn.addEventListener("click", () => {
     }
     startTestTone();
     isRunning = true;
+    lastFrameTime = performance.now();
+    frameCount = 0;
     testBtn.textContent = "Stop Tone";
     testBtn.classList.add("active");
     statusEl.textContent = "Playing A440 + harmonics...";
