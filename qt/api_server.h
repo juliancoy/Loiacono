@@ -50,6 +50,7 @@ private:
     void sendJson(QTcpSocket* socket, int status, const QJsonObject& obj);
     void sendJsonArray(QTcpSocket* socket, int status, const QJsonArray& arr);
     void sendPng(QTcpSocket* socket, const QByteArray& data);
+    void sendHtml(QTcpSocket* socket, const QByteArray& html);
     void sendError(QTcpSocket* socket, int status, const QString& msg);
     void sendOk(QTcpSocket* socket, const QString& msg);
 

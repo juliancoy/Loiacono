@@ -183,6 +183,102 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             sendOk(socket, "Deleted profile: " + name);
         }
 
+    } else if (method == "GET" && (path == "/" || path == "/index.html")) {
+        // Landing page with live spectrogram and API links
+        std::vector<float> spectrum;
+        transform_->getSpectrum(spectrum);
+        float peak = 0; int peakIdx = 0;
+        for (int i = 0; i < (int)spectrum.size(); i++) {
+            if (spectrum[i] > peak) { peak = spectrum[i]; peakIdx = i; }
+        }
+        double peakHz = transform_->numBins() > 0 ? transform_->binFreqHz(peakIdx) : 0;
+
+        QByteArray html = R"HTML(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Loiacono Spectrogram</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#d0d0e0;font-family:-apple-system,BlinkMacSystemFont,monospace;padding:24px;max-width:960px;margin:0 auto}
+h1{color:#a0c0ff;font-weight:400;font-size:1.5rem;margin-bottom:4px}
+.subtitle{color:#505070;font-size:.8rem;margin-bottom:20px}
+.spectrogram{background:#000;border:1px solid #1a1a2a;border-radius:6px;width:100%;margin-bottom:16px}
+.spectrogram img{width:100%;display:block;border-radius:5px;image-rendering:pixelated}
+.status{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:20px;padding:12px;background:#0e0e18;border:1px solid #1a1a2a;border-radius:6px}
+.stat{display:flex;flex-direction:column}
+.stat .label{font-size:.65rem;color:#505070;text-transform:uppercase;letter-spacing:.05em}
+.stat .value{font-size:1.1rem;color:#a0c0ff;font-weight:600}
+h2{color:#708090;font-size:.9rem;font-weight:400;margin:16px 0 8px;text-transform:uppercase;letter-spacing:.08em}
+.endpoints{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.ep{display:flex;gap:8px;padding:8px 12px;background:#0e0e18;border:1px solid #1a1a2a;border-radius:4px;text-decoration:none;transition:border-color .15s}
+.ep:hover{border-color:#2a3a5a}
+.method{font-size:.7rem;font-weight:700;padding:2px 6px;border-radius:3px;min-width:48px;text-align:center;flex-shrink:0}
+.get .method{background:#1a2a1a;color:#60c060}
+.put .method{background:#2a2a1a;color:#c0a040}
+.post .method{background:#1a1a2a;color:#6080c0}
+.delete .method{background:#2a1a1a;color:#c06060}
+.ep .path{color:#a0c0ff;font-size:.85rem}
+.ep .desc{color:#505070;font-size:.7rem}
+.ep-info{display:flex;flex-direction:column}
+.refresh-note{color:#404060;font-size:.7rem;text-align:center;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>Loiacono Transform</h1>
+<p class="subtitle">Rolling spectrogram &mdash; )HTML";
+        html += QString("v%1 | Qt %2 | %3")
+                    .arg(APP_VERSION).arg(qVersion())
+                    .arg(QSysInfo::currentCpuArchitecture()).toUtf8();
+        html += R"HTML(</p>
+<div class="spectrogram">
+<img id="spec" src="/api/screenshot" alt="Live Spectrogram">
+</div>
+<div class="status">
+<div class="stat"><span class="label">Peak</span><span class="value" id="peak">)HTML";
+        html += QString("%1 Hz").arg(peakHz, 0, 'f', 0).toUtf8();
+        html += R"HTML(</span></div>
+<div class="stat"><span class="label">Bins</span><span class="value" id="bins">)HTML";
+        html += QString::number(curBins_).toUtf8();
+        html += R"HTML(</span></div>
+<div class="stat"><span class="label">Multiple</span><span class="value" id="mult">)HTML";
+        html += QString::number(curMultiple_).toUtf8();
+        html += R"HTML(</span></div>
+<div class="stat"><span class="label">Range</span><span class="value" id="range">)HTML";
+        html += QString("%1-%2 Hz").arg(curFreqMin_).arg(curFreqMax_).toUtf8();
+        html += R"HTML(</span></div>
+<div class="stat"><span class="label">Sample Rate</span><span class="value">48000</span></div>
+</div>
+
+<h2>API Endpoints</h2>
+<div class="endpoints">
+<a class="ep get" href="/api/version"><span class="method">GET</span><div class="ep-info"><span class="path">/api/version</span><span class="desc">App version, platform, architecture</span></div></a>
+<a class="ep get" href="/api/status"><span class="method">GET</span><div class="ep-info"><span class="path">/api/status</span><span class="desc">Peak frequency, amplitude, settings</span></div></a>
+<a class="ep get" href="/api/screenshot"><span class="method">GET</span><div class="ep-info"><span class="path">/api/screenshot</span><span class="desc">Spectrogram as PNG image</span></div></a>
+<a class="ep get" href="/api/spectrum"><span class="method">GET</span><div class="ep-info"><span class="path">/api/spectrum</span><span class="desc">All frequency bins as JSON</span></div></a>
+<a class="ep get" href="/api/profile"><span class="method">GET</span><div class="ep-info"><span class="path">/api/profile</span><span class="desc">Current transform settings</span></div></a>
+<a class="ep put" href="#"><span class="method">PUT</span><div class="ep-info"><span class="path">/api/profile</span><span class="desc">Update settings {multiple, bins, freqMin, freqMax}</span></div></a>
+<a class="ep get" href="/api/profiles"><span class="method">GET</span><div class="ep-info"><span class="path">/api/profiles</span><span class="desc">List saved profiles</span></div></a>
+<a class="ep post" href="#"><span class="method">POST</span><div class="ep-info"><span class="path">/api/profiles/:name</span><span class="desc">Save current settings as profile</span></div></a>
+</div>
+
+<script>
+setInterval(async()=>{
+ document.getElementById('spec').src='/api/screenshot?t='+Date.now();
+ try{
+  const s=await(await fetch('/api/status')).json();
+  document.getElementById('peak').textContent=Math.round(s.peakFrequencyHz)+' Hz';
+  document.getElementById('bins').textContent=s.numBins;
+  document.getElementById('mult').textContent=s.multiple;
+  document.getElementById('range').textContent=s.freqMin+'-'+s.freqMax+' Hz';
+ }catch(e){}
+},500);
+</script>
+<p class="refresh-note">Screenshot and status refresh every 500ms</p>
+</body>
+</html>)HTML";
+        sendHtml(socket, html);
+
     } else {
         sendError(socket, 404, "Not found: " + path);
     }
@@ -216,6 +312,19 @@ void ApiServer::sendJsonArray(QTcpSocket* socket, int status, const QJsonArray& 
     response += QString("Content-Length: %1\r\n").arg(body.size()).toUtf8();
     response += "\r\n";
     response += body;
+    socket->write(response);
+    socket->flush();
+    socket->disconnectFromHost();
+}
+
+void ApiServer::sendHtml(QTcpSocket* socket, const QByteArray& html)
+{
+    QByteArray response;
+    response += "HTTP/1.1 200 OK\r\n";
+    response += "Content-Type: text/html; charset=utf-8\r\n";
+    response += QString("Content-Length: %1\r\n").arg(html.size()).toUtf8();
+    response += "\r\n";
+    response += html;
     socket->write(response);
     socket->flush();
     socket->disconnectFromHost();
