@@ -14,6 +14,8 @@ public:
     explicit SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent = nullptr);
 
     void setMaxAmplitude(float a) { maxAmplitude_ = a; }
+    const QImage& spectrogramImage() const { return image_; }
+    QImage renderToImage() const;
 
 protected:
     void paintEvent(QPaintEvent*) override;

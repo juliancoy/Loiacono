@@ -113,6 +113,18 @@ void SpectrogramWidget::paintEvent(QPaintEvent*)
     p.drawText(width() / 2 - 20, height() - 4, "time →");
 }
 
+QImage SpectrogramWidget::renderToImage() const
+{
+    // Render the widget (spectrogram + labels) to an image at widget size
+    QImage img(size(), QImage::Format_RGB32);
+    img.fill(Qt::black);
+    QPainter p(&img);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.drawImage(rect(), image_);
+    p.end();
+    return img;
+}
+
 SpectrogramWidget::RGB SpectrogramWidget::hotColormap(float t)
 {
     t = std::clamp(t, 0.0f, 1.0f);

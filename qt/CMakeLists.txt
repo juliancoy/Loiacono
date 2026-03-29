@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 # ── Qt ──
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 
 # ── RtAudio (submodule) ──
 set(RTAUDIO_BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -17,10 +17,12 @@ add_executable(loiacono_spectrogram
     main.cpp
     loiacono_rolling.cpp
     spectrogram_widget.cpp
+    api_server.cpp
 )
 
 target_link_libraries(loiacono_spectrogram PRIVATE
     Qt6::Widgets
+    Qt6::Network
     rtaudio
 )
 

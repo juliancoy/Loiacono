@@ -12,6 +12,7 @@
 #include "RtAudio.h"
 #include "loiacono_rolling.h"
 #include "spectrogram_widget.h"
+#include "api_server.h"
 
 // ─── RtAudio callback ───────────────────────────────────────────
 // Called on the audio thread with each buffer of samples.
@@ -145,6 +146,33 @@ int main(int argc, char* argv[])
                         .arg(bufferFrames));
             }
         }
+    }
+
+    // ── REST API server ──
+    auto* api = new ApiServer(&transform, spectrogram, &app);
+    api->updateCurrentSettings(multiple, numBins, freqMin, freqMax);
+
+    // When sliders change, sync to API server
+    auto syncApi = [&]() {
+        api->updateCurrentSettings(multiple, numBins, freqMin, freqMax);
+    };
+    QObject::connect(temporalSlider.slider, &QSlider::valueChanged, syncApi);
+    QObject::connect(binsSlider.slider, &QSlider::valueChanged, syncApi);
+    QObject::connect(minSlider.slider, &QSlider::valueChanged, syncApi);
+    QObject::connect(maxSlider.slider, &QSlider::valueChanged, syncApi);
+
+    // When API changes settings, sync sliders back
+    api->setSettingsCallback([&](int m, int b, int fmin, int fmax) {
+        temporalSlider.slider->setValue(m);
+        binsSlider.slider->setValue(b);
+        minSlider.slider->setValue(fmin);
+        maxSlider.slider->setValue(fmax);
+    });
+
+    quint16 apiPort = 8080;
+    if (api->startListening(apiPort)) {
+        statusBar->showMessage(statusBar->currentMessage() +
+                               QString(" | API: http://localhost:%1").arg(apiPort));
     }
 
     window->show();
