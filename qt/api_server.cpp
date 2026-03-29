@@ -19,6 +19,10 @@ bool ApiServer::startListening(quint16 port)
                  port, qPrintable(errorString()));
         return false;
     }
+
+    // MJPEG stream timer — push frames to all connected stream clients
+    connect(&streamTimer_, &QTimer::timeout, this, &ApiServer::pushMjpegFrame);
+
     qInfo("API server listening on http://localhost:%d", port);
     return true;
 }
@@ -183,6 +187,10 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             sendOk(socket, "Deleted profile: " + name);
         }
 
+    } else if (method == "GET" && path == "/api/stream") {
+        startMjpegStream(socket);
+        return; // don't close the socket — it stays open for streaming
+
     } else if (method == "GET" && (path == "/" || path == "/index.html")) {
         // Landing page with live spectrogram and API links
         std::vector<float> spectrum;
@@ -232,7 +240,7 @@ h2{color:#708090;font-size:.9rem;font-weight:400;margin:16px 0 8px;text-transfor
                     .arg(QSysInfo::currentCpuArchitecture()).toUtf8();
         html += R"HTML(</p>
 <div class="spectrogram">
-<img id="spec" src="/api/screenshot" alt="Live Spectrogram">
+<img id="spec" src="/api/stream" alt="Live Spectrogram">
 </div>
 <div class="status">
 <div class="stat"><span class="label">Peak</span><span class="value" id="peak">)HTML";
@@ -255,6 +263,7 @@ h2{color:#708090;font-size:.9rem;font-weight:400;margin:16px 0 8px;text-transfor
 <a class="ep get" href="/api/version"><span class="method">GET</span><div class="ep-info"><span class="path">/api/version</span><span class="desc">App version, platform, architecture</span></div></a>
 <a class="ep get" href="/api/status"><span class="method">GET</span><div class="ep-info"><span class="path">/api/status</span><span class="desc">Peak frequency, amplitude, settings</span></div></a>
 <a class="ep get" href="/api/screenshot"><span class="method">GET</span><div class="ep-info"><span class="path">/api/screenshot</span><span class="desc">Spectrogram as PNG image</span></div></a>
+<a class="ep get" href="/api/stream" target="_blank"><span class="method">GET</span><div class="ep-info"><span class="path">/api/stream</span><span class="desc">Live MJPEG video stream (~30fps)</span></div></a>
 <a class="ep get" href="/api/spectrum"><span class="method">GET</span><div class="ep-info"><span class="path">/api/spectrum</span><span class="desc">All frequency bins as JSON</span></div></a>
 <a class="ep get" href="/api/profile"><span class="method">GET</span><div class="ep-info"><span class="path">/api/profile</span><span class="desc">Current transform settings</span></div></a>
 <a class="ep put" href="#"><span class="method">PUT</span><div class="ep-info"><span class="path">/api/profile</span><span class="desc">Update settings {multiple, bins, freqMin, freqMax}</span></div></a>
@@ -264,7 +273,6 @@ h2{color:#708090;font-size:.9rem;font-weight:400;margin:16px 0 8px;text-transfor
 
 <script>
 setInterval(async()=>{
- document.getElementById('spec').src='/api/screenshot?t='+Date.now();
  try{
   const s=await(await fetch('/api/status')).json();
   document.getElementById('peak').textContent=Math.round(s.peakFrequencyHz)+' Hz';
@@ -274,7 +282,7 @@ setInterval(async()=>{
  }catch(e){}
 },500);
 </script>
-<p class="refresh-note">Screenshot and status refresh every 500ms</p>
+<p class="refresh-note">Live MJPEG stream at ~30fps | Status refreshes every 500ms</p>
 </body>
 </html>)HTML";
         sendHtml(socket, html);
@@ -352,6 +360,88 @@ void ApiServer::sendError(QTcpSocket* socket, int status, const QString& msg)
 void ApiServer::sendOk(QTcpSocket* socket, const QString& msg)
 {
     sendJson(socket, 200, {{"status", "ok"}, {"message", msg}});
+}
+
+// ── MJPEG Streaming ──
+// The browser <img src="/api/stream"> natively handles multipart JPEG streams.
+// No JavaScript needed — the browser decodes each JPEG frame as it arrives.
+
+static constexpr char MJPEG_BOUNDARY[] = "loiaconoframe";
+
+void ApiServer::startMjpegStream(QTcpSocket* socket)
+{
+    // Send the multipart header — connection stays open
+    QByteArray header;
+    header += "HTTP/1.1 200 OK\r\n";
+    header += "Content-Type: multipart/x-mixed-replace; boundary=";
+    header += MJPEG_BOUNDARY;
+    header += "\r\n";
+    header += "Cache-Control: no-cache, no-store\r\n";
+    header += "Access-Control-Allow-Origin: *\r\n";
+    header += "Connection: keep-alive\r\n";
+    header += "\r\n";
+    socket->write(header);
+    socket->flush();
+
+    streamClients_.insert(socket);
+
+    // Remove client on disconnect
+    connect(socket, &QTcpSocket::disconnected, this, [this, socket]() {
+        streamClients_.remove(socket);
+        socket->deleteLater();
+        if (streamClients_.isEmpty()) {
+            streamTimer_.stop();
+        }
+    });
+
+    // Start the frame timer if not already running (~30 fps)
+    if (!streamTimer_.isActive()) {
+        streamTimer_.start(33);
+    }
+}
+
+void ApiServer::pushMjpegFrame()
+{
+    if (streamClients_.isEmpty()) {
+        streamTimer_.stop();
+        return;
+    }
+
+    // Render the spectrogram to JPEG
+    QImage img = spectrogram_->renderToImage();
+    QByteArray jpegData;
+    QBuffer buf(&jpegData);
+    buf.open(QIODevice::WriteOnly);
+    img.save(&buf, "JPEG", 80); // quality 80 — good balance of size vs clarity
+
+    // Build the multipart frame
+    QByteArray frame;
+    frame += "--";
+    frame += MJPEG_BOUNDARY;
+    frame += "\r\n";
+    frame += "Content-Type: image/jpeg\r\n";
+    frame += QString("Content-Length: %1\r\n").arg(jpegData.size()).toUtf8();
+    frame += "\r\n";
+    frame += jpegData;
+    frame += "\r\n";
+
+    // Push to all connected clients
+    QSet<QTcpSocket*> dead;
+    for (auto* client : streamClients_) {
+        if (client->state() != QAbstractSocket::ConnectedState) {
+            dead.insert(client);
+            continue;
+        }
+        client->write(frame);
+        client->flush();
+    }
+    for (auto* d : dead) {
+        streamClients_.remove(d);
+        d->deleteLater();
+    }
+    if (streamClients_.isEmpty()) {
+        streamTimer_.stop();
+    }
 }
 
 QString ApiServer::profileDir() const

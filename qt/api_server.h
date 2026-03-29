@@ -8,6 +8,8 @@
 #include <QFile>
 #include <QBuffer>
 #include <QDateTime>
+#include <QTimer>
+#include <QSet>
 #include <functional>
 
 class LoiaconoRolling;
@@ -26,6 +28,7 @@ class SpectrogramWidget;
 //   POST /api/profiles/:name         - save current settings as named profile
 //   DELETE /api/profiles/:name       - delete a saved profile
 //   GET  /api/spectrum               - current spectrum as JSON array
+//   GET  /api/stream                 - MJPEG video stream (use in <img> tag)
 
 class ApiServer : public QTcpServer {
     Q_OBJECT
@@ -53,12 +56,16 @@ private:
     void sendHtml(QTcpSocket* socket, const QByteArray& html);
     void sendError(QTcpSocket* socket, int status, const QString& msg);
     void sendOk(QTcpSocket* socket, const QString& msg);
+    void startMjpegStream(QTcpSocket* socket);
+    void pushMjpegFrame();
 
     QString profileDir() const;
 
     LoiaconoRolling* transform_;
     SpectrogramWidget* spectrogram_;
     SettingsCallback settingsCallback_;
+    QTimer streamTimer_;
+    QSet<QTcpSocket*> streamClients_;
 
     // Cached current settings (kept in sync by main.cpp)
     int curMultiple_ = 40;
