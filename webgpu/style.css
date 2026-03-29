@@ -1,0 +1,88 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+h1 {
+    font-size: 1.4rem;
+    font-weight: 400;
+    margin-bottom: 12px;
+    color: #a0c0ff;
+    letter-spacing: 0.05em;
+}
+
+.controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 16px;
+}
+
+button {
+    background: #1a2a4a;
+    color: #a0c0ff;
+    border: 1px solid #2a3a5a;
+    padding: 8px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+
+button:hover {
+    background: #2a3a5a;
+}
+
+button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+button.active {
+    background: #1a4a2a;
+    border-color: #2a5a3a;
+    color: #a0ffc0;
+}
+
+#status {
+    font-size: 0.8rem;
+    color: #606080;
+}
+
+canvas {
+    border: 1px solid #1a1a2a;
+    border-radius: 4px;
+    margin-top: 8px;
+}
+
+.freq-labels {
+    display: flex;
+    justify-content: space-between;
+    width: 100%;
+    max-width: 1024px;
+    padding: 4px 0;
+    font-size: 0.7rem;
+    color: #505070;
+}
+
+#error {
+    color: #ff6060;
+    margin-top: 16px;
+    font-size: 0.85rem;
+    max-width: 600px;
+    text-align: center;
+    display: none;
+}

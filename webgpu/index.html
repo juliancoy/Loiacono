@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loiacono Transform — Live Spectrogram</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Loiacono Transform &mdash; WebGPU Live Spectrogram</h1>
+    <div class="controls">
+        <button id="startBtn">Start Microphone</button>
+        <button id="testBtn">Test Tone (A440)</button>
+        <span id="status">Initializing WebGPU...</span>
+    </div>
+    <canvas id="spectrogram" width="1024" height="512"></canvas>
+    <div class="freq-labels">
+        <span>100 Hz</span>
+        <span>500 Hz</span>
+        <span>1000 Hz</span>
+        <span>1500 Hz</span>
+        <span>2000 Hz</span>
+        <span>2500 Hz</span>
+        <span>3000 Hz</span>
+    </div>
+    <div id="error"></div>
+    <script type="module" src="main.js?v=4"></script>
+</body>
+</html>
