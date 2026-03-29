@@ -27,7 +27,7 @@ h1 {
     display: flex;
     gap: 12px;
     align-items: center;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
 }
 
 button {
@@ -42,40 +42,90 @@ button {
     transition: background 0.15s;
 }
 
-button:hover {
-    background: #2a3a5a;
-}
-
-button:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-}
-
-button.active {
-    background: #1a4a2a;
-    border-color: #2a5a3a;
-    color: #a0ffc0;
-}
+button:hover { background: #2a3a5a; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.active { background: #1a4a2a; border-color: #2a5a3a; color: #a0ffc0; }
 
 #status {
     font-size: 0.8rem;
-    color: #606080;
+    color: #808090;
+}
+
+/* ─── Settings ─────────────────────────────────────────── */
+.settings {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: #0e0e18;
+    border: 1px solid #1a1a2a;
+    border-radius: 6px;
+    max-width: 900px;
+    width: 100%;
+}
+
+.setting {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    min-width: 160px;
+}
+
+.setting label {
+    font-size: 0.75rem;
+    color: #707090;
+}
+
+.setting label span {
+    color: #a0c0ff;
+    font-weight: 600;
+}
+
+.setting input[type="range"] {
+    width: 100%;
+    accent-color: #4080c0;
+    height: 4px;
+}
+
+.setting-hint {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.65rem;
+    color: #404060;
+}
+
+/* ─── Spectrogram (horizontal: freq on Y, time on X) ─── */
+.spectrogram-container {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+}
+
+.freq-labels-y {
+    display: flex;
+    flex-direction: column-reverse;
+    justify-content: space-between;
+    font-size: 0.65rem;
+    color: #505070;
+    padding: 2px 0;
+    width: 50px;
+    text-align: right;
+    height: 400px;
 }
 
 canvas {
     border: 1px solid #1a1a2a;
     border-radius: 4px;
-    margin-top: 8px;
+    image-rendering: pixelated;
 }
 
-.freq-labels {
-    display: flex;
-    justify-content: space-between;
-    width: 100%;
-    max-width: 1024px;
-    padding: 4px 0;
+.time-label {
     font-size: 0.7rem;
-    color: #505070;
+    color: #404060;
+    margin-top: 4px;
+    text-align: center;
 }
 
 #error {

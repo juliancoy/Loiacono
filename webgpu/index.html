@@ -13,17 +13,36 @@
         <button id="testBtn">Test Tone (A440)</button>
         <span id="status">Initializing WebGPU...</span>
     </div>
-    <canvas id="spectrogram" width="1024" height="512"></canvas>
-    <div class="freq-labels">
-        <span>100 Hz</span>
-        <span>500 Hz</span>
-        <span>1000 Hz</span>
-        <span>1500 Hz</span>
-        <span>2000 Hz</span>
-        <span>2500 Hz</span>
-        <span>3000 Hz</span>
+
+    <div class="settings">
+        <div class="setting">
+            <label for="multipleSlider">Periods (multiple): <span id="multipleVal">40</span></label>
+            <input type="range" id="multipleSlider" min="2" max="120" value="40" step="1">
+            <div class="setting-hint">
+                <span>&larr; temporal precision</span>
+                <span>frequency precision &rarr;</span>
+            </div>
+        </div>
+        <div class="setting">
+            <label for="freqMinSlider">Freq min: <span id="freqMinVal">100</span> Hz</label>
+            <input type="range" id="freqMinSlider" min="20" max="1000" value="100" step="10">
+        </div>
+        <div class="setting">
+            <label for="freqMaxSlider">Freq max: <span id="freqMaxVal">3000</span> Hz</label>
+            <input type="range" id="freqMaxSlider" min="500" max="12000" value="3000" step="100">
+        </div>
+        <div class="setting">
+            <label for="freqStepSlider">Freq step: <span id="freqStepVal">5</span> Hz</label>
+            <input type="range" id="freqStepSlider" min="1" max="50" value="5" step="1">
+        </div>
     </div>
+
+    <div class="spectrogram-container">
+        <div class="freq-labels-y" id="freqLabelsY"></div>
+        <canvas id="spectrogram"></canvas>
+    </div>
+    <div class="time-label">time &rarr;</div>
     <div id="error"></div>
-    <script type="module" src="main.js?v=4"></script>
+    <script type="module" src="main.js?v=7"></script>
 </body>
 </html>

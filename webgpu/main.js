@@ -1,5 +1,5 @@
-// Loiacono Transform — WebGPU Live Spectrogram
-// main.js: WebGPU compute + Canvas 2D spectrogram visualization
+// Loiacono Transform — WebGPU Live Spectrogram (horizontal)
+// Time scrolls left-to-right, frequency on Y axis
 
 // ─── Inline WGSL Shader ─────────────────────────────────────────
 const LOIACONO_WGSL = /* wgsl */`
@@ -18,7 +18,6 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> L: array<f32>;
 
 const WORKGROUP_SIZE: u32 = 128;
-
 var<workgroup> shared_tr: array<f32, 128>;
 var<workgroup> shared_ti: array<f32, 128>;
 
@@ -29,7 +28,6 @@ fn main(
 ) {
     let frequency_ix = workgroup_id.x;
     let thread_ix = local_id.x;
-
     let this_f = f[frequency_ix];
     let this_p = 1.0 / this_f;
     let window_len = u32(f32(params.multiple) * this_p);
@@ -38,7 +36,6 @@ fn main(
 
     var tr: f32 = 0.0;
     var ti: f32 = 0.0;
-
     var n = window_start + thread_ix;
     loop {
         if (n >= params.signal_length) { break; }
@@ -71,22 +68,27 @@ fn main(
 }
 `;
 
-// ─── Configuration ───────────────────────────────────────────────
+// ─── Settings (live-adjustable) ──────────────────────────────────
 const SAMPLE_RATE = 48000;
-const SIGNAL_LENGTH = 1 << 15; // 32768
-const MULTIPLE = 40;
-const FREQ_START = 100 / SAMPLE_RATE;
-const FREQ_END = 3000 / SAMPLE_RATE;
-const WORKGROUP_SIZE = 128;
-const SPECTROGRAM_HEIGHT = 512;
+const SIGNAL_LENGTH = 1 << 15;
+const SPECTROGRAM_WIDTH = 800;  // time axis (pixels = frames of history)
 
-// Build frequency bins (normalized)
-const fprime = [];
-const freqStep = 5.0 / SAMPLE_RATE;
-for (let f = FREQ_START; f < FREQ_END; f += freqStep) {
-    fprime.push(f);
+let multiple = 40;
+let freqMin = 100;
+let freqMax = 3000;
+let freqStep = 5;
+let fprime = [];
+let numFreq = 0;
+
+function rebuildFreqs() {
+    fprime = [];
+    for (let f = freqMin / SAMPLE_RATE; f < freqMax / SAMPLE_RATE; f += freqStep / SAMPLE_RATE) {
+        fprime.push(f);
+    }
+    numFreq = fprime.length;
+    resizeCanvas();
+    updateFreqLabels();
 }
-const NUM_FREQ = fprime.length;
 
 // ─── DOM ─────────────────────────────────────────────────────────
 const canvas = document.getElementById("spectrogram");
@@ -95,20 +97,45 @@ const testBtn = document.getElementById("testBtn");
 const statusEl = document.getElementById("status");
 const errorEl = document.getElementById("error");
 
-canvas.width = NUM_FREQ;
-canvas.height = SPECTROGRAM_HEIGHT;
-canvas.style.width = "1024px";
-canvas.style.height = `${SPECTROGRAM_HEIGHT}px`;
-canvas.style.imageRendering = "pixelated";
+const multipleSlider = document.getElementById("multipleSlider");
+const multipleVal = document.getElementById("multipleVal");
+const freqMinSlider = document.getElementById("freqMinSlider");
+const freqMinVal = document.getElementById("freqMinVal");
+const freqMaxSlider = document.getElementById("freqMaxSlider");
+const freqMaxVal = document.getElementById("freqMaxVal");
+const freqStepSlider = document.getElementById("freqStepSlider");
+const freqStepVal = document.getElementById("freqStepVal");
 
-const ctx2d = canvas.getContext("2d");
-ctx2d.fillStyle = "#0a0a0f";
-ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+let ctx2d;
+
+const DISPLAY_HEIGHT = 400; // fixed CSS display height
+
+function resizeCanvas() {
+    canvas.width = SPECTROGRAM_WIDTH;
+    canvas.height = numFreq;
+    canvas.style.width = `${SPECTROGRAM_WIDTH}px`;
+    canvas.style.height = `${DISPLAY_HEIGHT}px`;
+    ctx2d = canvas.getContext("2d");
+    ctx2d.fillStyle = "#0a0a0f";
+    ctx2d.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function updateFreqLabels() {
+    const container = document.getElementById("freqLabelsY");
+    container.innerHTML = "";
+    const labelCount = 7;
+    for (let i = 0; i < labelCount; i++) {
+        const f = freqMin + (freqMax - freqMin) * (i / (labelCount - 1));
+        const span = document.createElement("span");
+        span.textContent = `${Math.round(f)} Hz`;
+        container.appendChild(span);
+    }
+}
 
 // ─── State ───────────────────────────────────────────────────────
 let device;
 let loiaconoPipeline, loiaconoBindGroup;
-let signalBuffer, spectrumBuffer, freqBuffer, paramsBuffer, readbackBuffer;
+let signalBuffer, spectrumBuffer, freqBuffer, paramsBuffer, readbackBufferA;
 let ringBuffer = new Float32Array(SIGNAL_LENGTH);
 let ringOffset = 0;
 let audioContext, audioSource, workletNode;
@@ -116,31 +143,31 @@ let isRunning = false;
 let testOscillator = null;
 let maxAmplitude = 1.0;
 let frameCount = 0;
-let gpuBusy = false;
-let readbackBufferA;
 
 // ─── Colormap ────────────────────────────────────────────────────
 function hotColor(t) {
     t = Math.max(0, Math.min(1, t));
+    // Apply gamma to boost visibility of mid-range values
+    t = Math.pow(t, 0.6);
     let r, g, b;
-    if (t < 0.1) {
-        const s = t / 0.1;
-        r = 0; g = 0; b = Math.floor(s * 128);
-    } else if (t < 0.3) {
-        const s = (t - 0.1) / 0.2;
-        r = 0; g = Math.floor(s * 255); b = Math.floor(128 + s * 127);
-    } else if (t < 0.5) {
-        const s = (t - 0.3) / 0.2;
+    if (t < 0.05) {
+        // True black for noise floor
+        r = 0; g = 0; b = 0;
+    } else if (t < 0.2) {
+        const s = (t - 0.05) / 0.15;
+        r = 0; g = 0; b = Math.floor(s * 200);
+    } else if (t < 0.4) {
+        const s = (t - 0.2) / 0.2;
+        r = 0; g = Math.floor(s * 255); b = Math.floor(200 + s * 55);
+    } else if (t < 0.6) {
+        const s = (t - 0.4) / 0.2;
         r = 0; g = 255; b = Math.floor(255 * (1 - s));
-    } else if (t < 0.7) {
-        const s = (t - 0.5) / 0.2;
+    } else if (t < 0.8) {
+        const s = (t - 0.6) / 0.2;
         r = Math.floor(s * 255); g = 255; b = 0;
-    } else if (t < 0.9) {
-        const s = (t - 0.7) / 0.2;
-        r = 255; g = Math.floor(255 * (1 - s)); b = 0;
     } else {
-        const s = (t - 0.9) / 0.1;
-        r = 255; g = Math.floor(s * 255); b = Math.floor(s * 255);
+        const s = (t - 0.8) / 0.2;
+        r = 255; g = Math.floor(255 * (1 - s)); b = 0;
     }
     return [r, g, b, 255];
 }
@@ -148,89 +175,24 @@ function hotColor(t) {
 // ─── WebGPU Init ─────────────────────────────────────────────────
 async function initWebGPU() {
     if (!navigator.gpu) {
-        throw new Error("WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.");
+        throw new Error("WebGPU is not supported. Try Chrome 113+.");
     }
-
     const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-        throw new Error("No WebGPU adapter found.");
-    }
-
+    if (!adapter) throw new Error("No WebGPU adapter found.");
     device = await adapter.requestDevice();
-
-    createBuffers();
-    createLoiaconoPipeline();
 
     statusEl.textContent = "Ready \u2014 click Start Microphone or Test Tone";
     startBtn.disabled = false;
     testBtn.disabled = false;
 }
 
-// ─── GPU Buffers ─────────────────────────────────────────────────
-function createBuffers() {
-    paramsBuffer = device.createBuffer({
-        size: 16,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
-    signalBuffer = device.createBuffer({
-        size: SIGNAL_LENGTH * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-
-    freqBuffer = device.createBuffer({
-        size: NUM_FREQ * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(freqBuffer, 0, new Float32Array(fprime));
-
-    spectrumBuffer = device.createBuffer({
-        size: NUM_FREQ * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    });
-
-    readbackBufferA = device.createBuffer({
-        size: NUM_FREQ * 4,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-}
-
-// ─── Loiacono Compute Pipeline ───────────────────────────────────
-function createLoiaconoPipeline() {
-    const shaderModule = device.createShaderModule({ code: LOIACONO_WGSL });
-
-    const bindGroupLayout = device.createBindGroupLayout({
-        entries: [
-            { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-        ],
-    });
-
-    loiaconoPipeline = device.createComputePipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-        compute: { module: shaderModule, entryPoint: "main" },
-    });
-
-    loiaconoBindGroup = device.createBindGroup({
-        layout: bindGroupLayout,
-        entries: [
-            { binding: 0, resource: { buffer: paramsBuffer } },
-            { binding: 1, resource: { buffer: signalBuffer } },
-            { binding: 2, resource: { buffer: freqBuffer } },
-            { binding: 3, resource: { buffer: spectrumBuffer } },
-        ],
-    });
-}
-
-// ─── Spectrogram Drawing (Canvas 2D, GPU-scrolled) ───────────────
-function drawSpectrogramRow(spectrum) {
-    // Scroll existing image up by 1 pixel
-    const imageData = ctx2d.getImageData(0, 1, canvas.width, canvas.height - 1);
+// ─── Spectrogram Drawing (horizontal: time on X, freq on Y) ─────
+function drawSpectrogramColumn(spectrum) {
+    // Scroll existing image left by 1 pixel
+    const imageData = ctx2d.getImageData(1, 0, canvas.width - 1, canvas.height);
     ctx2d.putImageData(imageData, 0, 0);
 
-    // Auto-adjust max amplitude with decay
+    // Auto-adjust max amplitude
     let currentMax = 0;
     for (let i = 0; i < spectrum.length; i++) {
         if (spectrum[i] > currentMax) currentMax = spectrum[i];
@@ -238,22 +200,24 @@ function drawSpectrogramRow(spectrum) {
     if (currentMax > maxAmplitude) {
         maxAmplitude = currentMax;
     } else {
-        maxAmplitude = maxAmplitude * 0.999 + currentMax * 0.001;
+        maxAmplitude = maxAmplitude * 0.998 + currentMax * 0.002;
     }
     maxAmplitude = Math.max(maxAmplitude, 0.1);
 
-    // Draw new bottom row
-    const row = ctx2d.createImageData(canvas.width, 1);
+    // Draw new rightmost column (freq bins bottom-to-top = low freq at bottom)
+    const col = ctx2d.createImageData(1, canvas.height);
     const logMax = Math.log(1 + maxAmplitude);
-    for (let i = 0; i < NUM_FREQ; i++) {
+    for (let i = 0; i < numFreq && i < canvas.height; i++) {
+        // Map frequency index: low freq at bottom (canvas row = height-1-i)
+        const canvasRow = canvas.height - 1 - i;
         const normalized = Math.log(1 + spectrum[i]) / logMax;
         const [r, g, b, a] = hotColor(normalized);
-        row.data[i * 4] = r;
-        row.data[i * 4 + 1] = g;
-        row.data[i * 4 + 2] = b;
-        row.data[i * 4 + 3] = a;
+        col.data[canvasRow * 4] = r;
+        col.data[canvasRow * 4 + 1] = g;
+        col.data[canvasRow * 4 + 2] = b;
+        col.data[canvasRow * 4 + 3] = a;
     }
-    ctx2d.putImageData(row, 0, canvas.height - 1);
+    ctx2d.putImageData(col, canvas.width - 1, 0);
 }
 
 // ─── Audio Capture ───────────────────────────────────────────────
@@ -310,19 +274,18 @@ function startTestTone() {
             ringOffset = (ringOffset + 1) % SIGNAL_LENGTH;
         }
     };
-    // Generate enough samples to fill the buffer initially
     for (let i = 0; i < SIGNAL_LENGTH / 256; i++) genSamples();
     testOscillator = setInterval(genSamples, 5);
 }
 
-// ─── CPU Loiacono (fallback for readback issues) ─────────────────
-function cpuLoiacono(signal, freqs, multiple, signalLen) {
+// ─── CPU Loiacono ────────────────────────────────────────────────
+function cpuLoiacono(signal, freqs, mult, signalLen) {
     const spectrum = new Float32Array(freqs.length);
-    const MAX_WINDOW = 4096; // cap window size for real-time performance
+    const MAX_WINDOW = 4096;
     for (let fi = 0; fi < freqs.length; fi++) {
         const thisF = freqs[fi];
         const thisP = 1.0 / thisF;
-        const windowLen = Math.min(Math.floor(multiple * thisP), signalLen, MAX_WINDOW);
+        const windowLen = Math.min(Math.floor(mult * thisP), signalLen, MAX_WINDOW);
         const windowStart = signalLen - windowLen;
         const dftlen = 1.0 / Math.sqrt(windowLen);
         let tr = 0, ti = 0;
@@ -337,14 +300,14 @@ function cpuLoiacono(signal, freqs, multiple, signalLen) {
     return spectrum;
 }
 
-// ─── Frame Loop (GPU with readback, CPU fallback) ────────────────
+// ─── Frame Loop ──────────────────────────────────────────────────
 function runLoop() {
     if (!isRunning) return;
 
     try {
-        const spectrum = cpuLoiacono(ringBuffer, fprime, MULTIPLE, SIGNAL_LENGTH);
+        const spectrum = cpuLoiacono(ringBuffer, fprime, multiple, SIGNAL_LENGTH);
 
-        drawSpectrogramRow(spectrum);
+        drawSpectrogramColumn(spectrum);
         frameCount++;
         if (frameCount % 10 === 0) {
             let peak = 0, peakIdx = 0;
@@ -352,7 +315,7 @@ function runLoop() {
                 if (spectrum[i] > peak) { peak = spectrum[i]; peakIdx = i; }
             }
             const peakFreq = (fprime[peakIdx] * SAMPLE_RATE).toFixed(0);
-            statusEl.textContent = `Peak: ${peakFreq} Hz | Amp: ${peak.toFixed(1)} | Frame: ${frameCount}`;
+            statusEl.textContent = `Peak: ${peakFreq} Hz | Amp: ${peak.toFixed(1)} | Bins: ${numFreq} | Multiple: ${multiple} | Frame: ${frameCount}`;
         }
     } catch (e) {
         statusEl.textContent = "Error: " + e.message;
@@ -360,17 +323,48 @@ function runLoop() {
         return;
     }
 
-    setTimeout(runLoop, 50); // ~20fps target, don't block rAF
+    setTimeout(runLoop, 50);
 }
+
+// ─── Settings Handlers ───────────────────────────────────────────
+multipleSlider.addEventListener("input", () => {
+    multiple = parseInt(multipleSlider.value);
+    multipleVal.textContent = multiple;
+});
+
+freqMinSlider.addEventListener("input", () => {
+    freqMin = parseInt(freqMinSlider.value);
+    freqMinVal.textContent = freqMin;
+    if (freqMin >= freqMax - 100) {
+        freqMax = freqMin + 100;
+        freqMaxSlider.value = freqMax;
+        freqMaxVal.textContent = freqMax;
+    }
+    rebuildFreqs();
+});
+
+freqMaxSlider.addEventListener("input", () => {
+    freqMax = parseInt(freqMaxSlider.value);
+    freqMaxVal.textContent = freqMax;
+    if (freqMax <= freqMin + 100) {
+        freqMin = freqMax - 100;
+        freqMinSlider.value = freqMin;
+        freqMinVal.textContent = freqMin;
+    }
+    rebuildFreqs();
+});
+
+freqStepSlider.addEventListener("input", () => {
+    freqStep = parseInt(freqStepSlider.value);
+    freqStepVal.textContent = freqStep;
+    rebuildFreqs();
+});
 
 // ─── UI Handlers ─────────────────────────────────────────────────
 startBtn.addEventListener("click", async () => {
     if (isRunning && !testOscillator) {
         isRunning = false;
-        if (audioContext) {
-            audioContext.close();
-            audioContext = null;
-        }
+        if (audioContext) { audioContext.close(); audioContext = null; }
         startBtn.textContent = "Start Microphone";
         startBtn.classList.remove("active");
         statusEl.textContent = "Stopped";
@@ -384,7 +378,6 @@ startBtn.addEventListener("click", async () => {
             testBtn.classList.remove("active");
             testBtn.textContent = "Test Tone (A440)";
         }
-
         await startAudio();
         isRunning = true;
         startBtn.textContent = "Stop";
@@ -392,7 +385,7 @@ startBtn.addEventListener("click", async () => {
         statusEl.textContent = "Listening...";
         runLoop();
     } catch (e) {
-        showError("Microphone access denied or unavailable: " + e.message);
+        showError("Microphone error: " + e.message);
     }
 });
 
@@ -406,7 +399,6 @@ testBtn.addEventListener("click", () => {
         statusEl.textContent = "Ready";
         return;
     }
-
     startTestTone();
     isRunning = true;
     testBtn.textContent = "Stop Tone";
@@ -422,6 +414,7 @@ function showError(msg) {
 }
 
 // ─── Boot ────────────────────────────────────────────────────────
+rebuildFreqs();
 initWebGPU().catch((e) => {
     showError(e.message);
     console.error(e);
