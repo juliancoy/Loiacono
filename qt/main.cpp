@@ -92,16 +92,24 @@ static bool ensureSingleInstance(QLockFile& lock, QLocalServer& ipcServer,
     return false;
 }
 
-// ─── Audio setup (non-fatal) ─────────────────────────────────────
-static QString setupAudio(RtAudio& adc, double sampleRate,
-                           LoiaconoRolling* transform)
+// ─── Audio setup (non-fatal, supports device switching) ──────────
+static QString openDevice(RtAudio& adc, unsigned int deviceId,
+                           double sampleRate, LoiaconoRolling* transform)
 {
-    if (adc.getDeviceCount() < 1) {
-        return "No audio devices found — spectrogram will be blank until a mic is connected";
+    // Close existing stream if open
+    if (adc.isStreamOpen()) {
+        adc.stopStream();
+        adc.closeStream();
+    }
+
+    auto info = adc.getDeviceInfo(deviceId);
+    if (info.inputChannels < 1) {
+        return QString("Error: device '%1' has no input channels")
+            .arg(QString::fromStdString(info.name));
     }
 
     RtAudio::StreamParameters params;
-    params.deviceId = adc.getDefaultInputDevice();
+    params.deviceId = deviceId;
     params.nChannels = 1;
     unsigned int bufferFrames = 256;
 
@@ -109,15 +117,14 @@ static QString setupAudio(RtAudio& adc, double sampleRate,
                    static_cast<unsigned int>(sampleRate),
                    &bufferFrames, &audioCallback, transform);
     if (err != RTAUDIO_NO_ERROR) {
-        return "Failed to open audio stream — check microphone permissions";
+        return "Error: failed to open audio stream — check microphone permissions";
     }
 
     err = adc.startStream();
     if (err != RTAUDIO_NO_ERROR) {
-        return "Failed to start audio stream";
+        return "Error: failed to start audio stream";
     }
 
-    auto info = adc.getDeviceInfo(params.deviceId);
     return QString("Listening on: %1 | %2 Hz | buffer: %3")
         .arg(QString::fromStdString(info.name))
         .arg(sampleRate)
@@ -195,7 +202,12 @@ int main(int argc, char* argv[])
 
     // ── Audio (non-fatal) ──
     RtAudio adc;
-    QString audioStatus = setupAudio(adc, sampleRate, &transform);
+    QString audioStatus;
+    if (adc.getDeviceCount() < 1) {
+        audioStatus = "No audio devices found";
+    } else {
+        audioStatus = openDevice(adc, adc.getDefaultInputDevice(), sampleRate, &transform);
+    }
     statusBar->showMessage(audioStatus);
 
     // ── REST API server (try ports 8080-8090) ──
@@ -215,6 +227,35 @@ int main(int argc, char* argv[])
         binsSlider.slider->setValue(b);
         minSlider.slider->setValue(fmin);
         maxSlider.slider->setValue(fmax);
+    });
+
+    // Device list callback
+    api->setDeviceListCallback([&adc]() -> QJsonArray {
+        QJsonArray arr;
+        auto ids = adc.getDeviceIds();
+        unsigned int defaultIn = adc.getDefaultInputDevice();
+        for (auto id : ids) {
+            auto info = adc.getDeviceInfo(id);
+            if (info.inputChannels < 1) continue; // only show input devices
+            QJsonObject dev;
+            dev["id"] = static_cast<int>(id);
+            dev["name"] = QString::fromStdString(info.name);
+            dev["channels"] = static_cast<int>(info.inputChannels);
+            dev["sampleRate"] = static_cast<int>(info.preferredSampleRate);
+            dev["isDefault"] = (id == defaultIn);
+            dev["isActive"] = adc.isStreamOpen() &&
+                              // no direct way to query current device, so just mark default
+                              false;
+            arr.append(dev);
+        }
+        return arr;
+    });
+
+    // Device switch callback
+    api->setDeviceSwitchCallback([&adc, &transform, sampleRate, statusBar](unsigned int deviceId) -> QString {
+        QString result = openDevice(adc, deviceId, sampleRate, &transform);
+        statusBar->showMessage(result);
+        return result;
     });
 
     quint16 apiPort = 0;

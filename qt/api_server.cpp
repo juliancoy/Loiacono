@@ -189,6 +189,30 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             sendOk(socket, "Deleted profile: " + name);
         }
 
+    } else if (method == "GET" && path == "/api/devices") {
+        if (deviceListCb_) {
+            sendJsonArray(socket, 200, deviceListCb_());
+        } else {
+            sendError(socket, 500, "Device listing not available");
+        }
+
+    } else if (method == "PUT" && path == "/api/device") {
+        if (deviceSwitchCb_) {
+            unsigned int devId = static_cast<unsigned int>(body.value("id").toInt(-1));
+            if (devId == static_cast<unsigned int>(-1)) {
+                sendError(socket, 400, "Missing 'id' field");
+            } else {
+                QString result = deviceSwitchCb_(devId);
+                if (result.startsWith("Error")) {
+                    sendError(socket, 500, result);
+                } else {
+                    sendJson(socket, 200, {{"status", "ok"}, {"device", result}});
+                }
+            }
+        } else {
+            sendError(socket, 500, "Device switching not available");
+        }
+
     } else if (method == "GET" && path == "/api/stream") {
         startMjpegStream(socket);
         return; // don't close the socket — it stays open for streaming

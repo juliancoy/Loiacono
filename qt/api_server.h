@@ -29,6 +29,8 @@ class SpectrogramWidget;
 //   DELETE /api/profiles/:name       - delete a saved profile
 //   GET  /api/spectrum               - current spectrum as JSON array
 //   GET  /api/stream                 - MJPEG video stream (use in <img> tag)
+//   GET  /api/devices                - list audio input devices
+//   PUT  /api/device                 - switch audio input device {"id": 131}
 
 class ApiServer : public QTcpServer {
     Q_OBJECT
@@ -41,6 +43,12 @@ public:
     // Called by main to sync slider state when API changes settings
     using SettingsCallback = std::function<void(int multiple, int bins, int freqMin, int freqMax)>;
     void setSettingsCallback(SettingsCallback cb) { settingsCallback_ = std::move(cb); }
+
+    // Audio device callbacks
+    using DeviceListCallback = std::function<QJsonArray()>;
+    using DeviceSwitchCallback = std::function<QString(unsigned int deviceId)>;
+    void setDeviceListCallback(DeviceListCallback cb) { deviceListCb_ = std::move(cb); }
+    void setDeviceSwitchCallback(DeviceSwitchCallback cb) { deviceSwitchCb_ = std::move(cb); }
 
     // Keep current slider values in sync
     void updateCurrentSettings(int multiple, int bins, int freqMin, int freqMax);
@@ -64,6 +72,8 @@ private:
     LoiaconoRolling* transform_;
     SpectrogramWidget* spectrogram_;
     SettingsCallback settingsCallback_;
+    DeviceListCallback deviceListCb_;
+    DeviceSwitchCallback deviceSwitchCb_;
     QTimer streamTimer_;
     QSet<QTcpSocket*> streamClients_;
 
