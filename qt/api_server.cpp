@@ -57,7 +57,9 @@ void ApiServer::handleRequest(QTcpSocket* socket)
     if (parts.size() < 2) { sendError(socket, 400, "Bad request"); return; }
 
     QString method = parts[0];
-    QString path = parts[1];
+    QString fullPath = parts[1];
+    // Strip query string for route matching
+    QString path = fullPath.section('?', 0, 0);
 
     // Parse body for PUT/POST
     QJsonObject body;
