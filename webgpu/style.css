@@ -1,0 +1,140 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+h1 {
+    font-size: 1.4rem;
+    font-weight: 400;
+    margin-bottom: 12px;
+    color: #a0c0ff;
+    letter-spacing: 0.05em;
+}
+
+.controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+button {
+    background: #1a2a4a;
+    color: #a0c0ff;
+    border: 1px solid #2a3a5a;
+    padding: 8px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+
+button:hover { background: #2a3a5a; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.active { background: #1a4a2a; border-color: #2a5a3a; color: #a0ffc0; }
+
+#status {
+    font-size: 0.8rem;
+    color: #808090;
+}
+
+/* ─── Settings ─────────────────────────────────────────── */
+.settings {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    background: #0e0e18;
+    border: 1px solid #1a1a2a;
+    border-radius: 6px;
+    max-width: 900px;
+    width: 100%;
+}
+
+.setting {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    min-width: 160px;
+}
+
+.setting label {
+    font-size: 0.75rem;
+    color: #707090;
+}
+
+.setting label span {
+    color: #a0c0ff;
+    font-weight: 600;
+}
+
+.setting input[type="range"] {
+    width: 100%;
+    accent-color: #4080c0;
+    height: 4px;
+}
+
+.setting-hint {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.65rem;
+    color: #404060;
+}
+
+/* ─── Spectrogram (horizontal: freq on Y, time on X) ─── */
+.spectrogram-container {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+}
+
+.freq-labels-y {
+    position: relative;
+    font-size: 0.65rem;
+    color: #505070;
+    width: 40px;
+    text-align: right;
+    height: 400px;
+}
+
+.freq-labels-y span {
+    white-space: nowrap;
+    padding-right: 6px;
+}
+
+canvas {
+    border: 1px solid #1a1a2a;
+    border-radius: 4px;
+    image-rendering: pixelated;
+}
+
+.time-label {
+    font-size: 0.7rem;
+    color: #404060;
+    margin-top: 4px;
+    text-align: center;
+}
+
+#error {
+    color: #ff6060;
+    margin-top: 16px;
+    font-size: 0.85rem;
+    max-width: 600px;
+    text-align: center;
+    display: none;
+}

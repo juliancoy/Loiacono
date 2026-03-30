@@ -1,0 +1,31 @@
+cmake_minimum_required(VERSION 3.16)
+project(LoiaconoSpectrogram LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+
+# ── Qt ──
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+
+# ── RtAudio (submodule) ──
+set(RTAUDIO_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory(rtaudio)
+
+# ── Application ──
+add_executable(loiacono_spectrogram
+    main.cpp
+    loiacono_rolling.cpp
+    spectrogram_widget.cpp
+    api_server.cpp
+)
+
+target_link_libraries(loiacono_spectrogram PRIVATE
+    Qt6::Widgets
+    Qt6::Network
+    rtaudio
+)
+
+target_include_directories(loiacono_spectrogram PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)

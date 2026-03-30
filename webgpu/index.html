@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loiacono Transform — Live Spectrogram</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>Loiacono Transform &mdash; WebGPU Live Spectrogram</h1>
+    <div class="controls">
+        <button id="startBtn">Start Microphone</button>
+        <button id="testBtn">Test Tone (A440)</button>
+        <span id="status">Initializing WebGPU...</span>
+    </div>
+
+    <div class="settings">
+        <div class="setting">
+            <label for="multipleSlider">Temporal precision: <span id="multipleVal">40</span> periods</label>
+            <input type="range" id="multipleSlider" min="2" max="120" value="40" step="1">
+            <div class="setting-hint">
+                <span>&larr; fast response</span>
+                <span>sharp peaks &rarr;</span>
+            </div>
+        </div>
+        <div class="setting">
+            <label for="freqBinsSlider">Frequency precision: <span id="freqBinsVal">200</span> bins</label>
+            <input type="range" id="freqBinsSlider" min="32" max="600" value="200" step="1">
+            <div class="setting-hint">
+                <span>&larr; faster</span>
+                <span>more detail &rarr;</span>
+            </div>
+        </div>
+        <div class="setting">
+            <label for="freqMinSlider">Freq min: <span id="freqMinVal">100</span> Hz</label>
+            <input type="range" id="freqMinSlider" min="20" max="2000" value="100" step="10">
+        </div>
+        <div class="setting">
+            <label for="freqMaxSlider">Freq max: <span id="freqMaxVal">3000</span> Hz</label>
+            <input type="range" id="freqMaxSlider" min="500" max="12000" value="3000" step="100">
+        </div>
+    </div>
+
+    <div class="spectrogram-container">
+        <div class="freq-labels-y" id="freqLabelsY"></div>
+        <canvas id="spectrogram"></canvas>
+    </div>
+    <div class="time-label">time &rarr;</div>
+    <div id="error"></div>
+    <script type="module" src="main.js?v=8"></script>
+</body>
+</html>

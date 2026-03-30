@@ -1,0 +1,66 @@
+#pragma once
+#include <QWidget>
+#include <QImage>
+#include <QTimer>
+#include <vector>
+#include "loiacono_rolling.h"
+
+// Combined spectrogram + histogram widget
+// Left: scrolling spectrogram (time on X, freq on Y)
+// Right: live spectrum histogram (amplitude bars)
+// Overlay: runtime stats
+
+class SpectrogramWidget : public QWidget {
+    Q_OBJECT
+public:
+    explicit SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent = nullptr);
+
+    // Gradient controls
+    void setGain(float g) { gain_ = g; update(); }
+    void setGamma(float g) { gamma_ = g; update(); }
+    void setFloor(float f) { floor_ = f; update(); }
+    float gain() const { return gain_; }
+    float gamma() const { return gamma_; }
+    float floor() const { return floor_; }
+
+    const QImage& spectrogramImage() const { return image_; }
+    QImage renderToImage() const;
+
+    // Runtime stats for display
+    struct FrameStats {
+        double fps = 0;
+        double peakHz = 0;
+        float peakAmp = 0;
+        float maxAmp = 0;
+    };
+    FrameStats frameStats() const { return frameStats_; }
+
+protected:
+    void paintEvent(QPaintEvent*) override;
+
+private slots:
+    void tick();
+
+private:
+    struct RGB { uint8_t r, g, b; };
+    RGB colormap(float amplitude) const;
+
+    LoiaconoRolling* transform_;
+    QImage image_;        // spectrogram backing store
+    QTimer timer_;
+
+    // Gradient parameters
+    float gain_ = 1.0f;   // pre-log multiplier
+    float gamma_ = 0.6f;  // post-normalize power curve
+    float floor_ = 0.05f; // below this = black (noise gate)
+
+    float maxAmplitude_ = 1.0f;
+    std::vector<float> spectrum_;
+    FrameStats frameStats_;
+
+    // FPS tracking
+    int frameCount_ = 0;
+    qint64 lastFpsTime_ = 0;
+
+    static constexpr int HISTOGRAM_WIDTH = 120; // pixels for the histogram panel
+};
