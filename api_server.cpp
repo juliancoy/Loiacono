@@ -3,6 +3,10 @@
 #include "spectrogram_widget.h"
 #include <QImage>
 #include <QStandardPaths>
+#include <QWidget>
+#include <QMainWindow>
+#include <QLayout>
+#include <QWindow>
 
 static const char* APP_VERSION = "1.0.0";
 
@@ -336,6 +340,125 @@ setInterval(async()=>{
 </body>
 </html>)HTML";
         sendHtml(socket, html);
+
+    } else if (method == "GET" && path == "/api/debug/sizes") {
+        // Recursively collect widget size information
+        std::function<QJsonObject(QWidget*)> collectWidgetInfo = [&](QWidget* widget) -> QJsonObject {
+            if (!widget) return QJsonObject{{"error", "null widget"}};
+            
+            QJsonObject info;
+            info["class"] = widget->metaObject()->className();
+            info["objectName"] = widget->objectName().isEmpty() ? "(unnamed)" : widget->objectName();
+            
+            QRect geo = widget->geometry();
+            QRect frame = widget->frameGeometry();
+            QSize min = widget->minimumSize();
+            QSize max = widget->maximumSize();
+            QSizePolicy policy = widget->sizePolicy();
+            
+            info["geometry"] = QJsonObject{
+                {"x", geo.x()}, {"y", geo.y()},
+                {"width", geo.width()}, {"height", geo.height()}
+            };
+            info["frameGeometry"] = QJsonObject{
+                {"x", frame.x()}, {"y", frame.y()},
+                {"width", frame.width()}, {"height", frame.height()}
+            };
+            info["sizeHint"] = QJsonObject{
+                {"width", widget->sizeHint().width()},
+                {"height", widget->sizeHint().height()}
+            };
+            info["minimumSize"] = QJsonObject{{"width", min.width()}, {"height", min.height()}};
+            info["maximumSize"] = QJsonObject{{"width", max.width()}, {"height", max.height()}};
+            info["sizePolicy"] = QJsonObject{
+                {"horizontal", policy.horizontalPolicy()},
+                {"vertical", policy.verticalPolicy()},
+                {"expanding", policy.horizontalPolicy() == QSizePolicy::Expanding || 
+                              policy.verticalPolicy() == QSizePolicy::Expanding}
+            };
+            info["isVisible"] = widget->isVisible();
+            info["isEnabled"] = widget->isEnabled();
+            
+            // Handle OpenGL widget specially
+            if (QString(widget->metaObject()->className()).contains("GL", Qt::CaseInsensitive) ||
+                QString(widget->metaObject()->className()).contains("OpenGL", Qt::CaseInsensitive)) {
+                info["type"] = "opengl";
+            }
+            
+            // Recursively collect children
+            QJsonArray children;
+            for (QObject* child : widget->children()) {
+                if (QWidget* childWidget = qobject_cast<QWidget*>(child)) {
+                    children.append(collectWidgetInfo(childWidget));
+                }
+            }
+            if (!children.isEmpty()) {
+                info["children"] = children;
+                info["childCount"] = children.size();
+            }
+            
+            // Add layout info if present
+            if (QLayout* layout = widget->layout()) {
+                info["layout"] = QJsonObject{
+                    {"type", layout->metaObject()->className()},
+                    {"margin", layout->contentsMargins().left()}, // same for all sides usually
+                    {"spacing", layout->spacing()}
+                };
+                
+                QJsonArray layoutItems;
+                for (int i = 0; i < layout->count(); ++i) {
+                    QLayoutItem* item = layout->itemAt(i);
+                    QJsonObject itemInfo;
+                    if (item->widget()) {
+                        itemInfo["type"] = "widget";
+                        itemInfo["widget"] = collectWidgetInfo(item->widget());
+                    } else if (item->layout()) {
+                        itemInfo["type"] = "layout";
+                        itemInfo["class"] = item->layout()->metaObject()->className();
+                    } else {
+                        itemInfo["type"] = "spacer";
+                    }
+                    layoutItems.append(itemInfo);
+                }
+                info["layoutItems"] = layoutItems;
+            }
+            
+            return info;
+        };
+        
+        // Find the main window by traversing up from spectrogram
+        QJsonObject hierarchy;
+        QWidget* root = spectrogram_;
+        while (root && !qobject_cast<QMainWindow*>(root)) {
+            root = root->parentWidget();
+        }
+        if (!root) root = spectrogram_; // fallback
+        
+        hierarchy["root"] = collectWidgetInfo(root);
+        
+        // Also include spectrogram-specific info
+        hierarchy["spectrogram"] = QJsonObject{
+            {"size", QJsonObject{{"width", spectrogram_->width()}, {"height", spectrogram_->height()}}},
+            {"canvasSize", QJsonObject{{"width", spectrogram_->width()}, {"height", spectrogram_->height()}}},
+            {"isVisible", spectrogram_->isVisible()}
+        };
+        
+        // Get screen info
+        if (QWindow* window = root->window()->windowHandle()) {
+            QScreen* screen = window->screen();
+            if (screen) {
+                hierarchy["screen"] = QJsonObject{
+                    {"name", screen->name()},
+                    {"geometry", QJsonObject{
+                        {"width", screen->geometry().width()},
+                        {"height", screen->geometry().height()}
+                    }},
+                    {"devicePixelRatio", screen->devicePixelRatio()}
+                };
+            }
+        }
+        
+        sendJson(socket, 200, hierarchy);
 
     } else {
         sendError(socket, 404, "Not found: " + path);

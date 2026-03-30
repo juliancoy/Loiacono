@@ -5,6 +5,7 @@
 #include <QHBoxLayout>
 #include <QPainter>
 #include <QPaintEvent>
+#include <QResizeEvent>
 #include <QWheelEvent>
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,11 @@ protected:
     {
         QPainter p(this);
         owner_->paintContent(p, size());
+    }
+
+    void resizeEvent(QResizeEvent*) override
+    {
+        owner_->onCanvasResized();
     }
 
     void wheelEvent(QWheelEvent* event) override
@@ -58,7 +64,8 @@ void SpectrogramWidget::setHardwareAccelerationEnabled(bool enabled)
 void SpectrogramWidget::setDisplayedTimeSeconds(double seconds)
 {
     displaySeconds_ = std::max(0.5, seconds);
-    lastColumnTime_ = 0;
+    lastColumnSampleCount_ = transform_->getStats().totalSamples;
+    pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
     update();
 }
@@ -66,9 +73,29 @@ void SpectrogramWidget::setDisplayedTimeSeconds(double seconds)
 void SpectrogramWidget::resetHistory()
 {
     image_.fill(Qt::black);
-    lastColumnTime_ = 0;
+    lastColumnSampleCount_ = transform_->getStats().totalSamples;
+    pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
     historyRevision_++;
+    if (canvas_) canvas_->update();
+}
+
+void SpectrogramWidget::onCanvasResized()
+{
+    QRect spectRect = spectrogramRect(canvas_->size());
+    
+    // Resize the image to match new canvas size
+    if (image_.width() != spectRect.width() || image_.height() != spectRect.height()) {
+        QImage newImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
+        newImage.fill(Qt::black);
+        image_ = newImage;
+    }
+    
+    lastColumnSampleCount_ = transform_->getStats().totalSamples;
+    pendingColumnFraction_ = 0.0;
+    pendingGpuColumns_ = 0;
+    historyRevision_++;
+    
     if (canvas_) canvas_->update();
 }
 
@@ -199,10 +226,13 @@ void SpectrogramWidget::tick()
     QRect spectRect = spectrogramRect(canvas_->size());
 
     if (image_.width() != spectRect.width() || image_.height() != spectRect.height()) {
+        // Resize happened - onCanvasResized() will handle the reset
+        // Just resize the image here, reset is done in resize handler
         QImage newImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
         newImage.fill(Qt::black);
         image_ = newImage;
-        lastColumnTime_ = 0;
+        lastColumnSampleCount_ = transform_->getStats().totalSamples;
+        pendingColumnFraction_ = 0.0;
         pendingGpuColumns_ = 0;
         historyRevision_++;
     }
@@ -231,15 +261,20 @@ void SpectrogramWidget::tick()
 
     int w = image_.width();
     int h = image_.height();
-    qint64 wallNow = QDateTime::currentMSecsSinceEpoch();
-    bool firstColumn = (lastColumnTime_ == 0);
-    if (firstColumn) lastColumnTime_ = wallNow;
-    double columnIntervalMs = std::max(1.0, (displaySeconds_ * 1000.0) / std::max(1, w));
-    int columnsToAdvance = firstColumn ? 1 : static_cast<int>((wallNow - lastColumnTime_) / columnIntervalMs);
-    if (columnsToAdvance <= 0) columnsToAdvance = 0;
-    columnsToAdvance = std::min(columnsToAdvance, std::max(1, w));
+    auto runtimeStats = transform_->getStats();
+    if (lastColumnSampleCount_ == 0) {
+        lastColumnSampleCount_ = runtimeStats.totalSamples;
+    }
+    uint64_t newSamples = runtimeStats.totalSamples >= lastColumnSampleCount_
+        ? (runtimeStats.totalSamples - lastColumnSampleCount_)
+        : 0;
+    lastColumnSampleCount_ = runtimeStats.totalSamples;
+    double samplesPerColumn = std::max(1.0, (displaySeconds_ * transform_->sampleRate()) / std::max(1, w));
+    pendingColumnFraction_ += static_cast<double>(newSamples) / samplesPerColumn;
+    int columnsToAdvance = static_cast<int>(std::floor(pendingColumnFraction_));
+    columnsToAdvance = std::clamp(columnsToAdvance, 0, std::max(1, w));
     if (columnsToAdvance > 0) {
-        lastColumnTime_ = wallNow;
+        pendingColumnFraction_ -= columnsToAdvance;
     }
     pendingGpuColumns_ = useDirectGpuPipeline() ? columnsToAdvance : 0;
 

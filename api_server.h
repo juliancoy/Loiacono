@@ -32,6 +32,7 @@ class SpectrogramWidget;
 //   GET  /api/runtime                - runtime stats (fps, cpu load, samples/sec)
 //   GET  /api/devices                - list audio input devices
 //   PUT  /api/device                 - switch audio input device {"id": 131}
+//   GET  /api/debug/sizes            - hierarchical widget size debug info
 
 class ApiServer : public QTcpServer {
     Q_OBJECT

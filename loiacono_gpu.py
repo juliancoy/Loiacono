@@ -1,3 +1,4 @@
+import numpy as np
 import os
 import sys
 import time
@@ -16,6 +17,14 @@ import vulkanese as ve
 from loiacono import *
 import vulkan as vk
 
+# Vulkan memory properties for host-visible coherent memory
+# HOST_COHERENT bit avoids the need for explicit flushing with 64-byte alignment
+LOIACONO_GPU_MEM_PROPERTIES = (
+    vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+    vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+    vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+)
+
 loiacono_home = os.path.dirname(os.path.abspath(__file__))
 
 # Create a compute shader
@@ -29,9 +38,7 @@ class Loiacono_GPU(ve.shader.Shader):
         constantsDict={},
         DEBUG=False,
         buffType="float",
-        memProperties=0
-        | vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        | vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        memProperties=None
     ):
 
         constantsDict["multiple"] = multiple
@@ -47,39 +54,43 @@ class Loiacono_GPU(ve.shader.Shader):
         self.constantsDict = constantsDict
         self.spectrum = np.zeros((len(fprime)))
 
+        # Use host-coherent memory to avoid Vulkan alignment issues with flushing
+        buffer_mem_props = LOIACONO_GPU_MEM_PROPERTIES
+        
         # Buffers: x (input signal), L (output spectrum), f (frequencies), offset
+        # Note: vulkanese uses 'shape' not 'dimensionVals'
         buffers = [
             ve.buffer.StorageBuffer(
                 device=self.device,
                 name="x",
                 memtype=buffType,
                 qualifier="readonly",
-                dimensionVals=[signalLength],
-                memProperties=memProperties,
+                shape=[signalLength],
+                memProperties=buffer_mem_props,
             ),
             ve.buffer.StorageBuffer(
                 device=self.device,
                 name="L",
                 memtype=buffType,
                 qualifier="writeonly",
-                dimensionVals=[len(fprime)],
-                memProperties=memProperties,
+                shape=[len(fprime)],
+                memProperties=buffer_mem_props,
             ),
             ve.buffer.StorageBuffer(
                 device=self.device,
                 name="f",
                 memtype=buffType,
                 qualifier="readonly",
-                dimensionVals=[len(fprime)],
-                memProperties=memProperties,
+                shape=[len(fprime)],
+                memProperties=buffer_mem_props,
             ),
             ve.buffer.StorageBuffer(
                 device=self.device,
                 name="offset",
                 memtype="uint",
                 qualifier="readonly",
-                dimensionVals=[16],
-                memProperties=memProperties,
+                shape=[16],
+                memProperties=buffer_mem_props,
             ),
         ]
 
@@ -100,7 +111,9 @@ class Loiacono_GPU(ve.shader.Shader):
         )
         self.finalize()
 
-        self.gpuBuffers.f.set(fprime)
+        # Convert fprime to the buffer's expected type (float32)
+        fprime_converted = np.array(fprime, dtype=self.gpuBuffers.f.pythonType)
+        self.gpuBuffers.f.set(fprime_converted)
         self.gpuBuffers.offset.zeroInitialize()
         self.offset = 0
 
@@ -112,7 +125,9 @@ class Loiacono_GPU(ve.shader.Shader):
         print("vlen " + str(vlen))
 
     def feed(self, newData, blocking=True):
-        self.gpuBuffers.x.setByIndexStart(self.offset, newData)
+        # Convert newData to the buffer's expected type
+        newData_converted = np.array(newData, dtype=self.gpuBuffers.x.pythonType)
+        self.gpuBuffers.x.setByIndexStart(self.offset, newData_converted)
         self.offset = (self.offset + len(newData)) % self.signalLength
         self.gpuBuffers.offset.setByIndex(index=0, data=[self.offset])
         self.run(blocking)

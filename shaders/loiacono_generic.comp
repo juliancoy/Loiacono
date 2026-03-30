@@ -1,0 +1,76 @@
+// Generic Loiacono Transform - works on all Vulkan implementations
+// One workgroup per frequency bin, shared-memory reduction
+// No subgroup operations, no cross-workgroup synchronization
+
+#version 450
+
+#define PI 3.1415926
+
+#define multiple 40
+#define SIGNAL_LENGTH 4096
+#define PROCTYPE float
+#define LG_WG_SIZE 7
+#define THREADS_PER_WORKGROUP 128
+#define windowed 0
+// This will be replaced by constant definitions
+layout(std430, set = 0, binding = 0 ) buffer x_buf
+{
+   readonly float x[4096];
+};
+layout(std430, set = 0, binding = 1 ) buffer L_buf
+{
+   writeonly float L[100];
+};
+layout(std430, set = 0, binding = 2 ) buffer f_buf
+{
+   readonly float f[100];
+};
+layout(std430, set = 0, binding = 3 ) buffer offset_buf
+{
+   readonly uint offset[16];
+};
+// This will be replaced by buffer definitions
+
+layout (local_size_x = THREADS_PER_WORKGROUP, local_size_y = 1, local_size_z = 1) in;
+
+shared float sharedTr[THREADS_PER_WORKGROUP];
+shared float sharedTi[THREADS_PER_WORKGROUP];
+
+void main() {
+    uint frequency_ix = gl_WorkGroupID.x;
+    uint thread_ix = gl_LocalInvocationID.x;
+
+    float thisF = f[frequency_ix];
+    float thisP = 1.0 / thisF;
+    uint windowStart = uint(SIGNAL_LENGTH - multiple * thisP);
+    float dftlen = 1.0 / sqrt(multiple / thisF);
+
+    // Each thread accumulates over multiple samples
+    float Tr = 0.0;
+    float Ti = 0.0;
+
+    for (uint n = windowStart + thread_ix; n < SIGNAL_LENGTH; n += THREADS_PER_WORKGROUP) {
+        uint read_ix = (n + offset[0]) % SIGNAL_LENGTH;
+        float thisDatum = x[read_ix];
+        Tr += thisDatum * cos(2.0 * PI * thisF * float(n)) * dftlen;
+        Ti -= thisDatum * sin(2.0 * PI * thisF * float(n)) * dftlen;
+    }
+
+    // Workgroup-local reduction via shared memory
+    sharedTr[thread_ix] = Tr;
+    sharedTi[thread_ix] = Ti;
+    barrier();
+
+    for (uint stride = THREADS_PER_WORKGROUP / 2; stride > 0; stride >>= 1) {
+        if (thread_ix < stride) {
+            sharedTr[thread_ix] += sharedTr[thread_ix + stride];
+            sharedTi[thread_ix] += sharedTi[thread_ix + stride];
+        }
+        barrier();
+    }
+
+    // Thread 0 writes the final magnitude for this frequency
+    if (thread_ix == 0) {
+        L[frequency_ix] = sqrt(sharedTr[0] * sharedTr[0] + sharedTi[0] * sharedTi[0]);
+    }
+}

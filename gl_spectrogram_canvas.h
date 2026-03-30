@@ -24,6 +24,7 @@ public:
 protected:
     void initializeGL() override;
     void paintGL() override;
+    void resizeEvent(QResizeEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
 
 private:

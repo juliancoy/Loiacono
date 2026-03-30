@@ -34,3 +34,42 @@ target_link_libraries(loiacono_spectrogram PRIVATE
 target_include_directories(loiacono_spectrogram PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
 )
+
+# ── Tests ──
+add_executable(test_cpp_consistency
+    tests/test_cpp_consistency.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
+    loiacono_rolling.cpp
+    loiacono_parallel.cpp
+)
+
+target_link_libraries(test_cpp_consistency PRIVATE
+    Qt6::Widgets
+    Qt6::Network
+    Qt6::OpenGLWidgets
+    rtaudio
+)
+
+target_include_directories(test_cpp_consistency PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)
+
+add_executable(test_simple_consistency
+    tests/test_simple_consistency.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
+    loiacono_rolling.cpp
+    loiacono_parallel.cpp
+)
+
+target_link_libraries(test_simple_consistency PRIVATE
+    Qt6::Widgets
+    Qt6::Network
+    Qt6::OpenGLWidgets
+    rtaudio
+)
+
+target_include_directories(test_simple_consistency PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)

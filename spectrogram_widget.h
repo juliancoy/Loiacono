@@ -32,6 +32,7 @@ public:
     void setDisplayedTimeSeconds(double seconds);
     double displayedTimeSeconds() const { return displaySeconds_; }
     void resetHistory();
+    void onCanvasResized();
 
     const QImage& spectrogramImage() const { return image_; }
     QImage renderToImage() const;
@@ -88,7 +89,8 @@ private:
     // FPS tracking
     int frameCount_ = 0;
     qint64 lastFpsTime_ = 0;
-    qint64 lastColumnTime_ = 0;
+    uint64_t lastColumnSampleCount_ = 0;
+    double pendingColumnFraction_ = 0.0;
     int pendingGpuColumns_ = 0;
     int historyRevision_ = 0;
 

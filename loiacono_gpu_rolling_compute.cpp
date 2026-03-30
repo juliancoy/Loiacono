@@ -127,56 +127,23 @@ public:
                    const std::vector<double>& norms,
                    const std::vector<int>& windowLens)
     {
-        if (!ensureContext()) return false;
-        if (!context_->makeCurrent(surface_.get())) return false;
-        auto* f = context_->extraFunctions();
-
-        if (!ensureProgram(f, updateProgram_, kRollingUpdateShader) ||
-            !ensureProgram(f, magnitudeProgram_, kMagnitudeShader)) {
-            context_->doneCurrent();
-            return false;
-        }
-
-        if (!buffersInitialized_) {
-            f->glGenBuffers(kBufferCount, buffers_);
-            buffersInitialized_ = true;
-        }
-
-        const bool geometryChanged =
-            signalLength_ != signalLength || maxChunkLength_ != maxChunkLength || numBins_ != numBins;
-
-        if (geometryChanged) {
-            bindBufferData(f, buffers_[0], std::max(1, maxChunkLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-            bindBufferData(f, buffers_[1], std::max(1, signalLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-            bindBufferData(f, buffers_[5], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-            bindBufferData(f, buffers_[6], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-            bindBufferData(f, buffers_[7], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-
-            std::vector<float> zeros(std::max(1, numBins), 0.0f);
-            std::vector<float> zeroRing(std::max(1, signalLength), 0.0f);
-            f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
-            f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, signalLength * static_cast<int>(sizeof(float)), zeroRing.data());
-            f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[5]);
-            f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numBins * static_cast<int>(sizeof(float)), zeros.data());
-            f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[6]);
-            f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numBins * static_cast<int>(sizeof(float)), zeros.data());
-        }
-
-        std::vector<float> freqFloats(numBins);
-        std::vector<float> normFloats(numBins);
-        for (int i = 0; i < numBins; ++i) {
-            freqFloats[i] = static_cast<float>(freqs[i]);
-            normFloats[i] = static_cast<float>(norms[i]);
-        }
-        bindBufferData(f, buffers_[2], std::max(1, numBins) * static_cast<int>(sizeof(float)), freqFloats.data(), GL_DYNAMIC_DRAW);
-        bindBufferData(f, buffers_[3], std::max(1, numBins) * static_cast<int>(sizeof(float)), normFloats.data(), GL_DYNAMIC_DRAW);
-        bindBufferData(f, buffers_[4], std::max(1, numBins) * static_cast<int>(sizeof(int)), windowLens.data(), GL_DYNAMIC_DRAW);
-
+        // Store configuration for lazy initialization
+        pendingSignalLength_ = signalLength;
+        pendingMaxChunkLength_ = maxChunkLength;
+        pendingNumBins_ = numBins;
+        pendingFreqs_ = freqs;
+        pendingNorms_ = norms;
+        pendingWindowLens_ = windowLens;
+        needsReconfigure_ = true;
+        
+        // Don't initialize OpenGL here - will be done lazily in processChunk()
         signalLength_ = signalLength;
         maxChunkLength_ = maxChunkLength;
         numBins_ = numBins;
+        
+        // Mark as initialized so available() returns true
+        // Actual OpenGL initialization will happen in processChunk()
         initialized_ = true;
-        context_->doneCurrent();
         return true;
     }
 
@@ -186,8 +153,19 @@ public:
                       int ringHeadStart)
     {
         if (!initialized_ || count <= 0 || count > maxChunkLength_) return false;
-        if (!context_->makeCurrent(surface_.get())) return false;
+        
+        // Lazy initialization - create OpenGL context if needed
+        if (!ensureContext() || !context_->makeCurrent(surface_.get())) return false;
         auto* f = context_->extraFunctions();
+        
+        // Initialize OpenGL resources if needed
+        if (needsReconfigure_) {
+            if (!initializeOpenGLResources(f)) {
+                context_->doneCurrent();
+                return false;
+            }
+            needsReconfigure_ = false;
+        }
 
         f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[0]);
         f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * static_cast<int>(sizeof(float)), newSamples);
@@ -230,8 +208,20 @@ public:
     bool spectrum(std::vector<float>& outSpectrum) const
     {
         if (!initialized_ || numBins_ <= 0) return false;
-        if (!context_->makeCurrent(surface_.get())) return false;
+        
+        // Lazy initialization - create OpenGL context if needed
+        if (!ensureContext() || !context_->makeCurrent(surface_.get())) return false;
         auto* f = context_->extraFunctions();
+        
+        // Initialize OpenGL resources if needed
+        // Note: needsReconfigure_ is mutable so we can modify it in const method
+        if (needsReconfigure_) {
+            if (!initializeOpenGLResources(f)) {
+                context_->doneCurrent();
+                return false;
+            }
+            needsReconfigure_ = false;
+        }
 
         f->glUseProgram(magnitudeProgram_);
         bindBufferBase(f, 0, buffers_[5]);
@@ -260,7 +250,7 @@ public:
 private:
     static constexpr int kBufferCount = 8;
 
-    bool ensureContext()
+    bool ensureContext() const
     {
         if (context_ && surface_) return true;
 
@@ -319,17 +309,95 @@ private:
     {
         f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, index, buffer);
     }
+    
+    bool initializeOpenGLResources(QOpenGLExtraFunctions* f) const
+    {
+        if (!ensureProgram(f, updateProgram_, kRollingUpdateShader) ||
+            !ensureProgram(f, magnitudeProgram_, kMagnitudeShader)) {
+            return false;
+        }
+
+        if (!buffersInitialized_) {
+            f->glGenBuffers(kBufferCount, buffers_);
+            buffersInitialized_ = true;
+        }
+
+        // Use pending configuration if available, otherwise use current
+        int signalLength = pendingSignalLength_ > 0 ? pendingSignalLength_ : signalLength_;
+        int maxChunkLength = pendingMaxChunkLength_ > 0 ? pendingMaxChunkLength_ : maxChunkLength_;
+        int numBins = pendingNumBins_ > 0 ? pendingNumBins_ : numBins_;
+        
+        if (signalLength <= 0 || maxChunkLength <= 0 || numBins <= 0) {
+            return false;
+        }
+
+        bindBufferData(f, buffers_[0], std::max(1, maxChunkLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[1], std::max(1, signalLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[5], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[6], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[7], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+
+        std::vector<float> zeros(std::max(1, numBins), 0.0f);
+        std::vector<float> zeroRing(std::max(1, signalLength), 0.0f);
+        f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
+        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, signalLength * static_cast<int>(sizeof(float)), zeroRing.data());
+        f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[5]);
+        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numBins * static_cast<int>(sizeof(float)), zeros.data());
+        f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[6]);
+        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numBins * static_cast<int>(sizeof(float)), zeros.data());
+
+        // Use pending frequencies/norms/window lengths if available
+        const std::vector<double>& freqs = !pendingFreqs_.empty() ? pendingFreqs_ : std::vector<double>();
+        const std::vector<double>& norms = !pendingNorms_.empty() ? pendingNorms_ : std::vector<double>();
+        const std::vector<int>& windowLens = !pendingWindowLens_.empty() ? pendingWindowLens_ : std::vector<int>();
+        
+        if (freqs.empty() || norms.empty() || windowLens.empty()) {
+            return false;
+        }
+        
+        std::vector<float> freqFloats(numBins);
+        std::vector<float> normFloats(numBins);
+        for (int i = 0; i < numBins; ++i) {
+            freqFloats[i] = static_cast<float>(freqs[i]);
+            normFloats[i] = static_cast<float>(norms[i]);
+        }
+        bindBufferData(f, buffers_[2], std::max(1, numBins) * static_cast<int>(sizeof(float)), freqFloats.data(), GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[3], std::max(1, numBins) * static_cast<int>(sizeof(float)), normFloats.data(), GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[4], std::max(1, numBins) * static_cast<int>(sizeof(int)), windowLens.data(), GL_DYNAMIC_DRAW);
+
+        // Update current values from pending
+        if (pendingSignalLength_ > 0) signalLength_ = pendingSignalLength_;
+        if (pendingMaxChunkLength_ > 0) maxChunkLength_ = pendingMaxChunkLength_;
+        if (pendingNumBins_ > 0) numBins_ = pendingNumBins_;
+        
+        // Clear pending configuration
+        pendingSignalLength_ = 0;
+        pendingMaxChunkLength_ = 0;
+        pendingNumBins_ = 0;
+        pendingFreqs_.clear();
+        pendingNorms_.clear();
+        pendingWindowLens_.clear();
+        
+        return true;
+    }
 
     mutable std::unique_ptr<QOffscreenSurface> surface_;
     mutable std::unique_ptr<QOpenGLContext> context_;
-    GLuint updateProgram_ = 0;
-    GLuint magnitudeProgram_ = 0;
-    GLuint buffers_[kBufferCount] = {0, 0, 0, 0, 0, 0, 0, 0};
-    bool buffersInitialized_ = false;
+    mutable GLuint updateProgram_ = 0;
+    mutable GLuint magnitudeProgram_ = 0;
+    mutable GLuint buffers_[kBufferCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    mutable bool buffersInitialized_ = false;
     bool initialized_ = false;
-    int signalLength_ = 0;
-    int maxChunkLength_ = 0;
-    int numBins_ = 0;
+    mutable bool needsReconfigure_ = false;
+    mutable int signalLength_ = 0;
+    mutable int maxChunkLength_ = 0;
+    mutable int numBins_ = 0;
+    mutable int pendingSignalLength_ = 0;
+    mutable int pendingMaxChunkLength_ = 0;
+    mutable int pendingNumBins_ = 0;
+    mutable std::vector<double> pendingFreqs_;
+    mutable std::vector<double> pendingNorms_;
+    mutable std::vector<int> pendingWindowLens_;
 };
 
 LoiaconoGpuRollingCompute::LoiaconoGpuRollingCompute()

@@ -130,14 +130,9 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 pendingGpuChunks_.pop_front();
                 pendingGpuChunksOverflowed_ = true;
             }
-            if (gpuRollingCompute_ && gpuRollingCompute_->available()) {
-                const auto& latest = pendingGpuChunks_.back();
-                gpuRollingCompute_->processChunk(
-                    latest.newSamples.data(),
-                    count,
-                    startSampleCount,
-                    startRingHead);
-            }
+            // GPU compute will be processed in the GUI thread via takePendingGpuChunks()
+            // Don't call gpuRollingCompute_->processChunk() here as it uses OpenGL
+            // from the audio thread which causes threading issues
         } else if (mode == ComputeMode::SingleThread) {
             for (int i = 0; i < count; i++) {
                 processSample(samples[i]);

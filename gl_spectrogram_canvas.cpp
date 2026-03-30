@@ -9,6 +9,7 @@
 #include <QMatrix4x4>
 #include <QOpenGLExtraFunctions>
 #include <QPainter>
+#include <QResizeEvent>
 #include <QVector4D>
 #include <QWheelEvent>
 #include <algorithm>
@@ -409,7 +410,8 @@ void GlSpectrogramCanvas::paintGL()
 
     glViewport(0, 0, width(), height());
     glDisable(GL_DEPTH_TEST);
-    glClearColor(10.0f / 255.0f, 10.0f / 255.0f, 16.0f / 255.0f, 1.0f);
+    // RED background to clearly see the canvas bounds
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (owner_->useDirectGpuPipeline()) {
@@ -420,6 +422,12 @@ void GlSpectrogramCanvas::paintGL()
 
     QPainter p(this);
     owner_->paintDecorations(p, size());
+}
+
+void GlSpectrogramCanvas::resizeEvent(QResizeEvent* event)
+{
+    QOpenGLWidget::resizeEvent(event);
+    owner_->onCanvasResized();
 }
 
 void GlSpectrogramCanvas::wheelEvent(QWheelEvent* event)
@@ -848,6 +856,8 @@ bool GlSpectrogramCanvas::updateDirectTextures(int columnsToAdvance, const QRect
     directSpectrogramFront_->release();
     shiftProgram_.release();
 
+    // Detach texture from FBO before swapping to avoid "texture is attached" error
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebufferObject());
     std::swap(directSpectrogramFront_, directSpectrogramBack_);
     glViewport(0, 0, width(), height());
