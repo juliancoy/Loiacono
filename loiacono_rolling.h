@@ -69,7 +69,7 @@ public:
 
     struct GpuChunkDelta {
         std::vector<float> newSamples;
-        std::vector<float> oldSamples;
+        int ringHeadStart = 0;
         uint64_t startSampleCount = 0;
     };
     struct GpuChunkBatch {

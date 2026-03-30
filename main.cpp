@@ -15,6 +15,10 @@
 #include <QDir>
 #include <QLocalSocket>
 #include <QLocalServer>
+#include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -27,6 +31,68 @@
 static constexpr const char* APP_ID = "com.loiacono.spectrogram";
 static constexpr quint16 API_PORT_START = 8080;
 static constexpr quint16 API_PORT_END = 8090;
+
+struct SavedUiState {
+    int multiple = 40;
+    int bins = 200;
+    int freqMin = 100;
+    int freqMax = 3000;
+    int gainTenths = 10;
+    int gammaHundredths = 60;
+    int floorHundredths = 5;
+    int displayTenths = 80;
+    int modeIndex = 2;
+    int deviceId = -1;
+};
+
+static QString settingsFilePath()
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dir);
+    return QDir(dir).filePath("settings.json");
+}
+
+static SavedUiState loadSavedUiState()
+{
+    SavedUiState state;
+    QFile file(settingsFilePath());
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return state;
+
+    const auto doc = QJsonDocument::fromJson(file.readAll());
+    if (!doc.isObject()) return state;
+    const auto obj = doc.object();
+    state.multiple = obj.value("multiple").toInt(state.multiple);
+    state.bins = obj.value("bins").toInt(state.bins);
+    state.freqMin = obj.value("freqMin").toInt(state.freqMin);
+    state.freqMax = obj.value("freqMax").toInt(state.freqMax);
+    state.gainTenths = obj.value("gainTenths").toInt(state.gainTenths);
+    state.gammaHundredths = obj.value("gammaHundredths").toInt(state.gammaHundredths);
+    state.floorHundredths = obj.value("floorHundredths").toInt(state.floorHundredths);
+    state.displayTenths = obj.value("displayTenths").toInt(state.displayTenths);
+    state.modeIndex = obj.value("modeIndex").toInt(state.modeIndex);
+    state.deviceId = obj.value("deviceId").toInt(state.deviceId);
+    return state;
+}
+
+static void saveUiState(const SavedUiState& state)
+{
+    const QJsonObject obj{
+        {"multiple", state.multiple},
+        {"bins", state.bins},
+        {"freqMin", state.freqMin},
+        {"freqMax", state.freqMax},
+        {"gainTenths", state.gainTenths},
+        {"gammaHundredths", state.gammaHundredths},
+        {"floorHundredths", state.floorHundredths},
+        {"displayTenths", state.displayTenths},
+        {"modeIndex", state.modeIndex},
+        {"deviceId", state.deviceId},
+    };
+
+    QFile file(settingsFilePath());
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
+    file.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+}
 
 // ─── RtAudio callback ───────────────────────────────────────────
 static int audioCallback(void*, void* inputBuffer, unsigned int nFrames,
@@ -164,7 +230,12 @@ int main(int argc, char* argv[])
     // Transform
     LoiaconoRolling transform;
     double sampleRate = 48000;
-    int freqMin = 100, freqMax = 3000, numBins = 200, multiple = 40;
+    SavedUiState savedState = loadSavedUiState();
+    int freqMin = std::clamp(savedState.freqMin, 20, 2000);
+    int freqMax = std::clamp(savedState.freqMax, 500, 12000);
+    int numBins = std::clamp(savedState.bins, 32, 600);
+    int multiple = std::clamp(savedState.multiple, 2, 120);
+    if (freqMin >= freqMax - 50) freqMax = std::min(12000, freqMin + 50);
     transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
 
     auto* window = new QMainWindow;
@@ -205,10 +276,10 @@ int main(int argc, char* argv[])
     auto* row2Lay = new QHBoxLayout(row2);
     row2Lay->setContentsMargins(4, 2, 4, 2);
     row2Lay->setSpacing(12);
-    row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, 10, 10.0f, "x"));
-    row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, 60, 100.0f, ""));
-    row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, 5, 100.0f, ""));
-    row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, 80, 10.0f, " s"));
+    row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, std::clamp(savedState.gainTenths, 1, 200), 10.0f, "x"));
+    row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, std::clamp(savedState.gammaHundredths, 10, 200), 100.0f, ""));
+    row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, std::clamp(savedState.floorHundredths, 0, 50), 100.0f, ""));
+    row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, std::clamp(savedState.displayTenths, 10, 300), 10.0f, " s"));
     mainLayout->addWidget(row2);
 
     // ── Settings row 3: Input + execution/display mode ──
@@ -234,7 +305,7 @@ int main(int argc, char* argv[])
     addMode("Multi-thread + GPU display", LoiaconoRolling::ComputeMode::MultiThread, true);
     addMode("GPU compute + CPU display", LoiaconoRolling::ComputeMode::GpuCompute, false);
     addMode("GPU compute + GPU display", LoiaconoRolling::ComputeMode::GpuCompute, true);
-    modeCombo->setCurrentIndex(2);
+    modeCombo->setCurrentIndex(std::clamp(savedState.modeIndex, 0, modeCombo->count() - 1));
 
     auto addLabeledField = [&](const QString& labelText, QWidget* field) {
         auto* box = new QWidget;
@@ -254,11 +325,30 @@ int main(int argc, char* argv[])
 
     // ── Spectrogram ──
     auto* spectrogram = new SpectrogramWidget(&transform);
+    spectrogram->setGain(slGain->value() / 10.0f);
+    spectrogram->setGamma(slGamma->value() / 100.0f);
+    spectrogram->setFloor(slFloor->value() / 100.0f);
+    spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
     mainLayout->addWidget(spectrogram, 1);
 
     window->setCentralWidget(central);
     auto* statusBar = window->statusBar();
     statusBar->setStyleSheet("font-size: 11px; color: #607090;");
+
+    auto saveStateNow = [&]() {
+        SavedUiState current;
+        current.multiple = slMultiple->value();
+        current.bins = slBins->value();
+        current.freqMin = slMin->value();
+        current.freqMax = slMax->value();
+        current.gainTenths = slGain->value();
+        current.gammaHundredths = slGamma->value();
+        current.floorHundredths = slFloor->value();
+        current.displayTenths = slDisplaySeconds->value();
+        current.modeIndex = modeCombo->currentIndex();
+        current.deviceId = devCombo->currentIndex() >= 0 ? devCombo->currentData().toInt() : currentDeviceId;
+        saveUiState(current);
+    };
 
     // ── Reconfigure transform ──
     auto reconfigure = [&]() {
@@ -269,6 +359,7 @@ int main(int argc, char* argv[])
         if (freqMin >= freqMax - 50) freqMax = freqMin + 50;
         transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
         spectrogram->resetHistory();
+        saveStateNow();
     };
     QObject::connect(slMultiple, &QSlider::valueChanged, reconfigure);
     QObject::connect(slBins, &QSlider::valueChanged, reconfigure);
@@ -299,7 +390,7 @@ int main(int argc, char* argv[])
         slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
     });
 
-    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo](int index) {
+    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo, saveStateNow](int index) {
         int packed = modeCombo->itemData(index).toInt();
         auto mode = static_cast<LoiaconoRolling::ComputeMode>(packed >> 1);
         bool gpuDisplay = (packed & 1) != 0;
@@ -311,6 +402,7 @@ int main(int argc, char* argv[])
             message += " | GPU compute unavailable, using multi-thread CPU";
         }
         statusBar->showMessage(message);
+        saveStateNow();
     });
     modeCombo->setCurrentIndex(modeCombo->currentIndex());
 
@@ -326,7 +418,8 @@ int main(int argc, char* argv[])
             if (info.inputChannels < 1) continue;
             QString name = QString::fromStdString(info.name);
             devCombo->addItem(name, id);
-            if (id == defaultIn) selectIdx = devCombo->count() - 1;
+            if (static_cast<int>(id) == savedState.deviceId) selectIdx = devCombo->count() - 1;
+            else if (selectIdx < 0 && id == defaultIn) selectIdx = devCombo->count() - 1;
         }
         if (selectIdx >= 0) devCombo->setCurrentIndex(selectIdx);
     };
@@ -337,12 +430,13 @@ int main(int argc, char* argv[])
         unsigned int devId = devCombo->itemData(comboIdx).toUInt();
         QString result = openDevice(adc, devId, sampleRate, &transform);
         statusBar->showMessage(result);
+        saveStateNow();
     };
     QObject::connect(devCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), switchDevice);
 
     // Open default device
-    if (adc.getDeviceCount() > 0) {
-        QString result = openDevice(adc, adc.getDefaultInputDevice(), sampleRate, &transform);
+    if (adc.getDeviceCount() > 0 && devCombo->currentIndex() >= 0) {
+        QString result = openDevice(adc, devCombo->currentData().toUInt(), sampleRate, &transform);
         statusBar->showMessage(result);
     } else {
         statusBar->showMessage("No audio devices found");
@@ -397,8 +491,10 @@ int main(int argc, char* argv[])
                                QString(" | http://localhost:%1").arg(apiPort));
     }
 
+    saveStateNow();
     window->show();
     int ret = app.exec();
+    saveStateNow();
     if (adc.isStreamOpen()) adc.closeStream();
     return ret;
 }

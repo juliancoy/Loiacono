@@ -116,10 +116,6 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
         if (mode == ComputeMode::GpuCompute) {
             const int startRingHead = ringHead_;
             const uint64_t startSampleCount = sampleCount_;
-            std::vector<float> oldSamples(static_cast<size_t>(count));
-            for (int i = 0; i < count; i++) {
-                oldSamples[static_cast<size_t>(i)] = ring_[(startRingHead + i) % RING_SIZE];
-            }
             for (int i = 0; i < count; i++) {
                 ring_[(startRingHead + i) % RING_SIZE] = samples[i];
             }
@@ -127,7 +123,7 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
             sampleCount_ += count;
             GpuChunkDelta delta;
             delta.newSamples.assign(samples, samples + count);
-            delta.oldSamples = std::move(oldSamples);
+            delta.ringHeadStart = startRingHead;
             delta.startSampleCount = startSampleCount;
             pendingGpuChunks_.push_back(std::move(delta));
             while (pendingGpuChunks_.size() > MAX_PENDING_GPU_CHUNKS) {
@@ -138,9 +134,9 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 const auto& latest = pendingGpuChunks_.back();
                 gpuRollingCompute_->processChunk(
                     latest.newSamples.data(),
-                    latest.oldSamples.data(),
                     count,
-                    startSampleCount);
+                    startSampleCount,
+                    startRingHead);
             }
         } else if (mode == ComputeMode::SingleThread) {
             for (int i = 0; i < count; i++) {

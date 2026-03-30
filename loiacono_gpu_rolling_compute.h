@@ -17,9 +17,9 @@ public:
                    const std::vector<double>& norms,
                    const std::vector<int>& windowLens);
     bool processChunk(const float* newSamples,
-                      const float* oldSamples,
                       int count,
-                      std::uint64_t startSampleCount);
+                      std::uint64_t startSampleCount,
+                      int ringHeadStart);
     bool spectrum(std::vector<float>& outSpectrum) const;
 
 private:

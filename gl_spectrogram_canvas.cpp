@@ -181,13 +181,9 @@ void GlSpectrogramCanvas::initializeGL()
         layout(std430, binding = 6) buffer TiBuf { float tiState[]; };
         uniform int signalLength;
         uniform int numBins;
-        uniform uint sampleCountLo;
-        uniform uint sampleCountHi;
+        uniform float sampleCountEnd;
         shared float sharedTr[128];
         shared float sharedTi[128];
-        double sampleCount64() {
-            return double(sampleCountHi) * 4294967296.0 + double(sampleCountLo);
-        }
         void main() {
             uint bin = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
@@ -196,16 +192,16 @@ void GlSpectrogramCanvas::initializeGL()
             float norm = norms[bin];
             int windowLen = windowLens[bin];
             uint offset = offsetData[0];
-            double endSampleCount = sampleCount64();
+            float endSampleCount = sampleCountEnd;
             float tr = 0.0;
             float ti = 0.0;
             for (int k = int(tid); k < windowLen; k += 128) {
                 int readIndex = (int(offset) - windowLen + k + signalLength) % signalLength;
-                double sampleIx = endSampleCount - double(windowLen) + double(k);
-                double angle = 6.283185307179586 * double(freq) * sampleIx;
-                float sample = ringData[readIndex];
-                tr += sample * float(cos(angle)) * norm;
-                ti -= sample * float(sin(angle)) * norm;
+                float sampleIx = endSampleCount - float(windowLen) + float(k);
+                float angle = 6.283185307179586 * freq * sampleIx;
+                float sampleValue = ringData[readIndex];
+                tr += sampleValue * cos(angle) * norm;
+                ti -= sampleValue * sin(angle) * norm;
             }
             sharedTr[tid] = tr;
             sharedTi[tid] = ti;
@@ -229,21 +225,19 @@ void GlSpectrogramCanvas::initializeGL()
         #version 430
         layout(local_size_x = 128) in;
         layout(std430, binding = 0) readonly buffer NewChunkBuf { float newChunk[]; };
-        layout(std430, binding = 1) readonly buffer OldChunkBuf { float oldChunk[]; };
+        layout(std430, binding = 1) readonly buffer RingBuf { float ringData[]; };
         layout(std430, binding = 2) readonly buffer FreqBuf { float freqs[]; };
         layout(std430, binding = 3) readonly buffer NormBuf { float norms[]; };
         layout(std430, binding = 4) readonly buffer WindowBuf { int windowLens[]; };
         layout(std430, binding = 5) buffer TrBuf { float trState[]; };
         layout(std430, binding = 6) buffer TiBuf { float tiState[]; };
         uniform int chunkLength;
+        uniform int signalLength;
         uniform int numBins;
-        uniform uint sampleBaseLo;
-        uniform uint sampleBaseHi;
+        uniform uint sampleBase;
+        uniform int ringHeadStart;
         shared float sharedTr[128];
         shared float sharedTi[128];
-        double sampleBase() {
-            return double(sampleBaseHi) * 4294967296.0 + double(sampleBaseLo);
-        }
         void main() {
             uint bin = gl_WorkGroupID.x;
             uint tid = gl_LocalInvocationID.x;
@@ -251,20 +245,20 @@ void GlSpectrogramCanvas::initializeGL()
             float freq = freqs[bin];
             float norm = norms[bin];
             int windowLen = windowLens[bin];
-            double base = sampleBase();
             float tr = 0.0;
             float ti = 0.0;
             for (int i = int(tid); i < chunkLength; i += 128) {
-                double sampleIx = base + double(i);
-                double angle = 6.283185307179586 * double(freq) * sampleIx;
-                float sample = newChunk[i];
-                tr += sample * float(cos(angle)) * norm;
-                ti -= sample * float(sin(angle)) * norm;
-                if (sampleIx >= double(windowLen)) {
-                    double oldAngle = 6.283185307179586 * double(freq) * (sampleIx - double(windowLen));
-                    float oldSample = oldChunk[i];
-                    tr -= oldSample * float(cos(oldAngle)) * norm;
-                    ti += oldSample * float(sin(oldAngle)) * norm;
+                uint sampleIx = sampleBase + uint(i);
+                float angle = 6.283185307179586 * freq * sampleIx;
+                float sampleValue = newChunk[i];
+                tr += sampleValue * cos(angle) * norm;
+                ti -= sampleValue * sin(angle) * norm;
+                if (sampleIx >= uint(windowLen)) {
+                    int oldIdx = (ringHeadStart + i - windowLen + signalLength) % signalLength;
+                    float oldAngle = 6.283185307179586 * freq * float(sampleIx - uint(windowLen));
+                    float oldSampleValue = ringData[oldIdx];
+                    tr -= oldSampleValue * cos(oldAngle) * norm;
+                    ti += oldSampleValue * sin(oldAngle) * norm;
                 }
             }
             sharedTr[tid] = tr;
@@ -606,6 +600,13 @@ bool GlSpectrogramCanvas::ensureDirectGpuResources(const QRect& spectRect, const
 {
     const int numBins = snapshot.numBins;
     if (numBins <= 0) return false;
+    if (!directBootstrapProgram_.isLinked() ||
+        !directRollingUpdateProgram_.isLinked() ||
+        !directMagnitudeProgram_.isLinked() ||
+        !directTextureProgram_.isLinked() ||
+        !directStatsProgram_.isLinked()) {
+        return false;
+    }
 
     ensureStorage(directSpectrogramFront_, spectRect.width(), spectRect.height());
     ensureStorage(directSpectrogramBack_, spectRect.width(), spectRect.height());
@@ -689,6 +690,7 @@ bool GlSpectrogramCanvas::ensureDirectGpuResources(const QRect& spectRect, const
 
 bool GlSpectrogramCanvas::bootstrapDirectRollingState(const LoiaconoRolling::GpuInputSnapshot& snapshot)
 {
+    if (!directBootstrapProgram_.isLinked()) return false;
     auto* f = context()->extraFunctions();
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, directBuffers_[DIRECT_BUF_RING]);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER,
@@ -716,8 +718,7 @@ bool GlSpectrogramCanvas::bootstrapDirectRollingState(const LoiaconoRolling::Gpu
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, directBuffers_[DIRECT_BUF_TI]);
     directBootstrapProgram_.setUniformValue("signalLength", directSignalLength_);
     directBootstrapProgram_.setUniformValue("numBins", directNumBins_);
-    directBootstrapProgram_.setUniformValue("sampleCountLo", static_cast<GLuint>(snapshot.sampleCount & 0xffffffffu));
-    directBootstrapProgram_.setUniformValue("sampleCountHi", static_cast<GLuint>((snapshot.sampleCount >> 32) & 0xffffffffu));
+    directBootstrapProgram_.setUniformValue("sampleCountEnd", static_cast<float>(snapshot.sampleCount));
     f->glDispatchCompute(static_cast<GLuint>(std::max(1, directNumBins_)), 1, 1);
     f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     directBootstrapProgram_.release();
@@ -727,6 +728,7 @@ bool GlSpectrogramCanvas::bootstrapDirectRollingState(const LoiaconoRolling::Gpu
 
 bool GlSpectrogramCanvas::runDirectRollingUpdates(const LoiaconoRolling::GpuChunkBatch& batch)
 {
+    if (!directRollingUpdateProgram_.isLinked()) return false;
     auto* f = context()->extraFunctions();
     directRollingUpdateProgram_.bind();
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, directBuffers_[DIRECT_BUF_FREQ]);
@@ -738,20 +740,32 @@ bool GlSpectrogramCanvas::runDirectRollingUpdates(const LoiaconoRolling::GpuChun
     for (const auto& chunk : batch.chunks) {
         const int count = static_cast<int>(chunk.newSamples.size());
         if (count <= 0) continue;
-        if (count > MAX_DIRECT_GPU_CHUNK || static_cast<int>(chunk.oldSamples.size()) != count) {
+        if (count > MAX_DIRECT_GPU_CHUNK) {
             directRollingUpdateProgram_.release();
             return false;
         }
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, directBuffers_[DIRECT_BUF_NEW_CHUNK]);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * static_cast<GLsizeiptr>(sizeof(float)), chunk.newSamples.data());
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, directBuffers_[DIRECT_BUF_OLD_CHUNK]);
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * static_cast<GLsizeiptr>(sizeof(float)), chunk.oldSamples.data());
         f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, directBuffers_[DIRECT_BUF_NEW_CHUNK]);
-        f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, directBuffers_[DIRECT_BUF_OLD_CHUNK]);
+        f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, directBuffers_[DIRECT_BUF_RING]);
         directRollingUpdateProgram_.setUniformValue("chunkLength", count);
-        directRollingUpdateProgram_.setUniformValue("sampleBaseLo", static_cast<GLuint>(chunk.startSampleCount & 0xffffffffu));
-        directRollingUpdateProgram_.setUniformValue("sampleBaseHi", static_cast<GLuint>((chunk.startSampleCount >> 32) & 0xffffffffu));
+        directRollingUpdateProgram_.setUniformValue("signalLength", directSignalLength_);
+        directRollingUpdateProgram_.setUniformValue("sampleBase", static_cast<GLuint>(chunk.startSampleCount & 0xffffffffu));
+        directRollingUpdateProgram_.setUniformValue("ringHeadStart", chunk.ringHeadStart);
         f->glDispatchCompute(static_cast<GLuint>(std::max(1, directNumBins_)), 1, 1);
+
+        const int firstChunk = std::min(count, directSignalLength_ - chunk.ringHeadStart);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, directBuffers_[DIRECT_BUF_RING]);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                        chunk.ringHeadStart * static_cast<GLsizeiptr>(sizeof(float)),
+                        firstChunk * static_cast<GLsizeiptr>(sizeof(float)),
+                        chunk.newSamples.data());
+        if (firstChunk < count) {
+            glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                            0,
+                            (count - firstChunk) * static_cast<GLsizeiptr>(sizeof(float)),
+                            chunk.newSamples.data() + firstChunk);
+        }
     }
     f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     directRollingUpdateProgram_.release();
@@ -760,6 +774,7 @@ bool GlSpectrogramCanvas::runDirectRollingUpdates(const LoiaconoRolling::GpuChun
 
 bool GlSpectrogramCanvas::runDirectMagnitudeCompute()
 {
+    if (!directMagnitudeProgram_.isLinked()) return false;
     auto* f = context()->extraFunctions();
     directMagnitudeProgram_.bind();
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, directBuffers_[DIRECT_BUF_TR]);

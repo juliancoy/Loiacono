@@ -17,7 +17,7 @@ const char* kRollingUpdateShader = R"(
     layout(local_size_x = 128) in;
 
     layout(std430, binding = 0) readonly buffer NewChunkBuf { float newChunk[]; };
-    layout(std430, binding = 1) readonly buffer OldChunkBuf { float oldChunk[]; };
+    layout(std430, binding = 1) readonly buffer RingBuf { float ringData[]; };
     layout(std430, binding = 2) readonly buffer FreqBuf { float freqs[]; };
     layout(std430, binding = 3) readonly buffer NormBuf { float norms[]; };
     layout(std430, binding = 4) readonly buffer WindowBuf { int windowLens[]; };
@@ -25,17 +25,13 @@ const char* kRollingUpdateShader = R"(
     layout(std430, binding = 6) buffer TiBuf { float tiState[]; };
 
     uniform int chunkLength;
+    uniform int signalLength;
     uniform int numBins;
-    uniform uint sampleBaseLo;
-    uniform uint sampleBaseHi;
+    uniform uint sampleBase;
+    uniform int ringHeadStart;
 
     shared float sharedTr[128];
     shared float sharedTi[128];
-
-    double sampleBase()
-    {
-        return double(sampleBaseHi) * 4294967296.0 + double(sampleBaseLo);
-    }
 
     void main()
     {
@@ -46,26 +42,23 @@ const char* kRollingUpdateShader = R"(
         float freq = freqs[bin];
         float norm = norms[bin];
         int windowLen = windowLens[bin];
-        double base = sampleBase();
 
         float tr = 0.0;
         float ti = 0.0;
         for (int i = int(tid); i < chunkLength; i += 128) {
-            double sampleIx = base + double(i);
-            double angle = 6.283185307179586 * double(freq) * sampleIx;
-            float c = float(cos(angle));
-            float s = float(sin(angle));
-            float sample = newChunk[i];
-            tr += sample * c * norm;
-            ti -= sample * s * norm;
+            uint sampleIx = sampleBase + uint(i);
+            float angle = 6.283185307179586 * freq * float(sampleIx);
+            float sampleValue = newChunk[i];
+            tr += sampleValue * cos(angle) * norm;
+            ti -= sampleValue * sin(angle) * norm;
 
-            if (sampleIx >= double(windowLen)) {
-                double oldAngle = 6.283185307179586 * double(freq) * (sampleIx - double(windowLen));
-                float oldC = float(cos(oldAngle));
-                float oldS = float(sin(oldAngle));
-                float oldSample = oldChunk[i];
-                tr -= oldSample * oldC * norm;
-                ti += oldSample * oldS * norm;
+            if (sampleIx >= uint(windowLen)) {
+                int oldIdx = (ringHeadStart + i - windowLen + signalLength) % signalLength;
+                uint oldSampleIx = sampleIx - uint(windowLen);
+                float oldAngle = 6.283185307179586 * freq * float(oldSampleIx);
+                float oldSampleValue = ringData[oldIdx];
+                tr -= oldSampleValue * cos(oldAngle) * norm;
+                ti += oldSampleValue * sin(oldAngle) * norm;
             }
         }
 
@@ -154,12 +147,15 @@ public:
 
         if (geometryChanged) {
             bindBufferData(f, buffers_[0], std::max(1, maxChunkLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
-            bindBufferData(f, buffers_[1], std::max(1, maxChunkLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+            bindBufferData(f, buffers_[1], std::max(1, signalLength) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
             bindBufferData(f, buffers_[5], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
             bindBufferData(f, buffers_[6], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
             bindBufferData(f, buffers_[7], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
 
             std::vector<float> zeros(std::max(1, numBins), 0.0f);
+            std::vector<float> zeroRing(std::max(1, signalLength), 0.0f);
+            f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
+            f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, signalLength * static_cast<int>(sizeof(float)), zeroRing.data());
             f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[5]);
             f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, numBins * static_cast<int>(sizeof(float)), zeros.data());
             f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[6]);
@@ -185,9 +181,9 @@ public:
     }
 
     bool processChunk(const float* newSamples,
-                      const float* oldSamples,
                       int count,
-                      std::uint64_t startSampleCount)
+                      std::uint64_t startSampleCount,
+                      int ringHeadStart)
     {
         if (!initialized_ || count <= 0 || count > maxChunkLength_) return false;
         if (!context_->makeCurrent(surface_.get())) return false;
@@ -195,8 +191,6 @@ public:
 
         f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[0]);
         f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * static_cast<int>(sizeof(float)), newSamples);
-        f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
-        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, count * static_cast<int>(sizeof(float)), oldSamples);
 
         f->glUseProgram(updateProgram_);
         bindBufferBase(f, 0, buffers_[0]);
@@ -208,14 +202,27 @@ public:
         bindBufferBase(f, 6, buffers_[6]);
 
         f->glUniform1i(f->glGetUniformLocation(updateProgram_, "chunkLength"), count);
+        f->glUniform1i(f->glGetUniformLocation(updateProgram_, "signalLength"), signalLength_);
         f->glUniform1i(f->glGetUniformLocation(updateProgram_, "numBins"), numBins_);
-        f->glUniform1ui(f->glGetUniformLocation(updateProgram_, "sampleBaseLo"),
+        f->glUniform1ui(f->glGetUniformLocation(updateProgram_, "sampleBase"),
                         static_cast<GLuint>(startSampleCount & 0xffffffffu));
-        f->glUniform1ui(f->glGetUniformLocation(updateProgram_, "sampleBaseHi"),
-                        static_cast<GLuint>((startSampleCount >> 32) & 0xffffffffu));
+        f->glUniform1i(f->glGetUniformLocation(updateProgram_, "ringHeadStart"), ringHeadStart);
 
         f->glDispatchCompute(static_cast<GLuint>(numBins_), 1, 1);
         f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        const int firstChunk = std::min(count, signalLength_ - ringHeadStart);
+        f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[1]);
+        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                           ringHeadStart * static_cast<int>(sizeof(float)),
+                           firstChunk * static_cast<int>(sizeof(float)),
+                           newSamples);
+        if (firstChunk < count) {
+            f->glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                               0,
+                               (count - firstChunk) * static_cast<int>(sizeof(float)),
+                               newSamples + firstChunk);
+        }
         context_->doneCurrent();
         return true;
     }
@@ -348,11 +355,11 @@ bool LoiaconoGpuRollingCompute::configure(int signalLength,
 }
 
 bool LoiaconoGpuRollingCompute::processChunk(const float* newSamples,
-                                             const float* oldSamples,
                                              int count,
-                                             std::uint64_t startSampleCount)
+                                             std::uint64_t startSampleCount,
+                                             int ringHeadStart)
 {
-    return impl_->processChunk(newSamples, oldSamples, count, startSampleCount);
+    return impl_->processChunk(newSamples, count, startSampleCount, ringHeadStart);
 }
 
 bool LoiaconoGpuRollingCompute::spectrum(std::vector<float>& outSpectrum) const
