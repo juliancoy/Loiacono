@@ -1,7 +1,29 @@
 #include "loiacono_rolling.h"
+#include "loiacono_parallel.h"
 #include <algorithm>
 
 static constexpr double TWO_PI = 2.0 * M_PI;
+
+LoiaconoRolling::ComputeMode LoiaconoRolling::activeComputeMode() const
+{
+    if (computeMode_ == ComputeMode::GpuCompute && !gpuComputeAvailable()) {
+        return ComputeMode::MultiThread;
+    }
+    return computeMode_;
+}
+
+const char* LoiaconoRolling::computeModeName(ComputeMode mode)
+{
+    switch (mode) {
+    case ComputeMode::SingleThread:
+        return "single-thread";
+    case ComputeMode::MultiThread:
+        return "multi-thread";
+    case ComputeMode::GpuCompute:
+        return "gpu-compute";
+    }
+    return "unknown";
+}
 
 void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMax,
                                  int numBins, int multiple)
@@ -70,8 +92,39 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (activeComputeMode() == ComputeMode::SingleThread) {
+            for (int i = 0; i < count; i++) {
+                processSample(samples[i]);
+            }
+        } else {
+        const int startRingHead = ringHead_;
+        const uint64_t startSampleCount = sampleCount_;
+
         for (int i = 0; i < count; i++) {
-            processSample(samples[i]);
+            ring_[(startRingHead + i) % RING_SIZE] = samples[i];
+        }
+        ringHead_ = (startRingHead + count) % RING_SIZE;
+        sampleCount_ += count;
+
+        if (activeComputeMode() == ComputeMode::SingleThread) {
+            for (int i = 0; i < count; i++) {
+                processSample(samples[i]);
+            }
+        } else {
+            loiacono::processBinsParallel(
+                workerCount_,
+                numBins_,
+                count,
+                startRingHead,
+                startSampleCount,
+                samples,
+                ring_,
+                freqs_,
+                norms_,
+                windowLens_,
+                Tr_,
+                Ti_);
+        }
         }
     }
 

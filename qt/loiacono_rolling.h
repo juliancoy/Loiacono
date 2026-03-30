@@ -4,9 +4,16 @@
 #include <cstdint>
 #include <mutex>
 #include <chrono>
+#include <thread>
 
 class LoiaconoRolling {
 public:
+    enum class ComputeMode {
+        SingleThread,
+        MultiThread,
+        GpuCompute,
+    };
+
     LoiaconoRolling() = default;
 
     void configure(double sampleRate, double freqMin, double freqMax,
@@ -20,6 +27,12 @@ public:
     double binFreqHz(int i) const { return freqs_[i] * sampleRate_; }
     double sampleRate() const { return sampleRate_; }
     int multiple() const { return multiple_; }
+    unsigned int cpuThreads() const { return workerCount_; }
+    void setComputeMode(ComputeMode mode) { computeMode_ = mode; }
+    ComputeMode computeMode() const { return computeMode_; }
+    ComputeMode activeComputeMode() const;
+    static const char* computeModeName(ComputeMode mode);
+    bool gpuComputeAvailable() const { return false; }
 
     // Runtime stats (thread-safe reads)
     struct Stats {
@@ -59,6 +72,8 @@ private:
     double totalChunkMicros_ = 0;
     double peakChunkMicros_ = 0;
     uint64_t lastChunkSamples_ = 0;
+    unsigned int workerCount_ = std::max(1u, std::thread::hardware_concurrency());
+    ComputeMode computeMode_ = ComputeMode::MultiThread;
 
     mutable std::mutex mutex_;
 };

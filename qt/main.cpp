@@ -8,12 +8,15 @@
 #include <QStatusBar>
 #include <QGroupBox>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QSplitter>
 #include <QLockFile>
 #include <QStandardPaths>
 #include <QDir>
 #include <QLocalSocket>
 #include <QLocalServer>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 
 #include "RtAudio.h"
@@ -194,9 +197,9 @@ int main(int argc, char* argv[])
     row1Lay->addWidget(makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax));
     mainLayout->addWidget(row1);
 
-    // ── Settings row 2: Gradient + Device ──
-    QSlider *slGain, *slGamma, *slFloor;
-    QLabel *lbGain, *lbGamma, *lbFloor;
+    // ── Settings row 2: Visual tuning ──
+    QSlider *slGain, *slGamma, *slFloor, *slDisplaySeconds;
+    QLabel *lbGain, *lbGamma, *lbFloor, *lbDisplaySeconds;
 
     auto* row2 = new QWidget;
     auto* row2Lay = new QHBoxLayout(row2);
@@ -205,15 +208,48 @@ int main(int argc, char* argv[])
     row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, 10, 10.0f, "x"));
     row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, 60, 100.0f, ""));
     row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, 5, 100.0f, ""));
-
-    // Device selector
-    auto* devCombo = new QComboBox;
-    devCombo->setMinimumWidth(180);
-    devCombo->setStyleSheet("QComboBox { font-size: 11px; }");
-    row2Lay->addWidget(new QLabel("Input:"));
-    row2Lay->addWidget(devCombo);
-
+    row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, 80, 10.0f, " s"));
     mainLayout->addWidget(row2);
+
+    // ── Settings row 3: Input + execution/display mode ──
+    auto* row3 = new QWidget;
+    auto* row3Lay = new QHBoxLayout(row3);
+    row3Lay->setContentsMargins(4, 2, 4, 2);
+    row3Lay->setSpacing(12);
+
+    auto comboStyle = QString("QComboBox { font-size: 11px; min-width: 180px; }");
+    auto labelStyle = QString("color: #b0c0e0; font-size: 11px;");
+
+    auto* devCombo = new QComboBox;
+    devCombo->setStyleSheet(comboStyle);
+    auto* computeCombo = new QComboBox;
+    computeCombo->setStyleSheet(comboStyle);
+    computeCombo->addItem("Single-thread", static_cast<int>(LoiaconoRolling::ComputeMode::SingleThread));
+    computeCombo->addItem("Multi-thread", static_cast<int>(LoiaconoRolling::ComputeMode::MultiThread));
+    computeCombo->addItem("GPU compute", static_cast<int>(LoiaconoRolling::ComputeMode::GpuCompute));
+    computeCombo->setCurrentIndex(1);
+
+    auto* displayCombo = new QComboBox;
+    displayCombo->setStyleSheet(comboStyle);
+    displayCombo->addItem("CPU display", 0);
+    displayCombo->addItem("GPU display", 1);
+
+    auto addLabeledField = [&](const QString& labelText, QWidget* field) {
+        auto* box = new QWidget;
+        auto* lay = new QVBoxLayout(box);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->setSpacing(2);
+        auto* label = new QLabel(labelText);
+        label->setStyleSheet(labelStyle);
+        lay->addWidget(label);
+        lay->addWidget(field);
+        return box;
+    };
+
+    row3Lay->addWidget(addLabeledField("Input device", devCombo), 1);
+    row3Lay->addWidget(addLabeledField("Compute mode", computeCombo));
+    row3Lay->addWidget(addLabeledField("Display mode", displayCombo));
+    mainLayout->addWidget(row3);
 
     // ── Spectrogram ──
     auto* spectrogram = new SpectrogramWidget(&transform);
@@ -231,6 +267,7 @@ int main(int argc, char* argv[])
         freqMax = slMax->value();
         if (freqMin >= freqMax - 50) freqMax = freqMin + 50;
         transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
+        spectrogram->resetHistory();
     };
     QObject::connect(slMultiple, &QSlider::valueChanged, reconfigure);
     QObject::connect(slBins, &QSlider::valueChanged, reconfigure);
@@ -246,6 +283,34 @@ int main(int argc, char* argv[])
     });
     QObject::connect(slFloor, &QSlider::valueChanged, [spectrogram](int v) {
         spectrogram->setFloor(v / 100.0f);
+    });
+    QObject::connect(slDisplaySeconds, &QSlider::valueChanged, [spectrogram](int v) {
+        spectrogram->setDisplayedTimeSeconds(v / 10.0);
+    });
+    spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
+    QObject::connect(spectrogram, &SpectrogramWidget::displayedTimeChanged, [slDisplaySeconds](double seconds) {
+        int sliderValue = static_cast<int>(std::lround(seconds * 10.0));
+        sliderValue = std::clamp(sliderValue, slDisplaySeconds->minimum(), slDisplaySeconds->maximum());
+        slDisplaySeconds->setValue(sliderValue);
+    });
+    QObject::connect(spectrogram, &SpectrogramWidget::frequencyRangeChanged, [slMin, slMax](int newMin, int newMax) {
+        slMin->setValue(std::clamp(newMin, slMin->minimum(), slMin->maximum()));
+        slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
+    });
+
+    QObject::connect(displayCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [spectrogram, statusBar](int index) {
+        bool gpuDisplay = index == 1;
+        spectrogram->setHardwareAccelerationEnabled(gpuDisplay);
+        statusBar->showMessage(QString("Display mode: %1").arg(gpuDisplay ? "GPU display" : "CPU display"));
+    });
+    QObject::connect(computeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, statusBar, computeCombo](int index) {
+        auto mode = static_cast<LoiaconoRolling::ComputeMode>(computeCombo->itemData(index).toInt());
+        transform.setComputeMode(mode);
+        if (mode == LoiaconoRolling::ComputeMode::GpuCompute && !transform.gpuComputeAvailable()) {
+            statusBar->showMessage("GPU compute selected, but no GPU compute backend is available yet; using multi-thread CPU");
+        } else {
+            statusBar->showMessage(QString("Compute mode: %1").arg(LoiaconoRolling::computeModeName(transform.activeComputeMode())));
+        }
     });
 
     // ── Audio ──

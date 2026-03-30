@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 # ── Qt ──
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network OpenGLWidgets)
 
 # ── RtAudio (submodule) ──
 set(RTAUDIO_BUILD_TESTING OFF CACHE BOOL "" FORCE)
@@ -15,7 +15,9 @@ add_subdirectory(rtaudio)
 # ── Application ──
 add_executable(loiacono_spectrogram
     main.cpp
+    gl_spectrogram_canvas.cpp
     loiacono_rolling.cpp
+    loiacono_parallel.cpp
     spectrogram_widget.cpp
     api_server.cpp
 )
@@ -23,6 +25,7 @@ add_executable(loiacono_spectrogram
 target_link_libraries(loiacono_spectrogram PRIVATE
     Qt6::Widgets
     Qt6::Network
+    Qt6::OpenGLWidgets
     rtaudio
 )
 

@@ -2,8 +2,13 @@
 #include <QWidget>
 #include <QImage>
 #include <QTimer>
+#include <QRect>
+#include <QPoint>
 #include <vector>
 #include "loiacono_rolling.h"
+
+class QPainter;
+class QWheelEvent;
 
 // Combined spectrogram + histogram widget
 // Left: scrolling spectrogram (time on X, freq on Y)
@@ -22,6 +27,11 @@ public:
     float gain() const { return gain_; }
     float gamma() const { return gamma_; }
     float floor() const { return floor_; }
+    void setHardwareAccelerationEnabled(bool enabled);
+    bool hardwareAccelerationEnabled() const { return hardwareAccelerationEnabled_; }
+    void setDisplayedTimeSeconds(double seconds);
+    double displayedTimeSeconds() const { return displaySeconds_; }
+    void resetHistory();
 
     const QImage& spectrogramImage() const { return image_; }
     QImage renderToImage() const;
@@ -35,19 +45,35 @@ public:
     };
     FrameStats frameStats() const { return frameStats_; }
 
-protected:
-    void paintEvent(QPaintEvent*) override;
+signals:
+    void displayedTimeChanged(double seconds);
+    void frequencyRangeChanged(int freqMin, int freqMax);
 
+protected:
 private slots:
     void tick();
 
 private:
+    class RasterCanvas;
+    friend class GlSpectrogramCanvas;
+    friend class RasterCanvas;
+
     struct RGB { uint8_t r, g, b; };
     RGB colormap(float amplitude) const;
+    void replaceCanvas();
+    void paintContent(QPainter& p, const QSize& canvasSize);
+    void paintDecorations(QPainter& p, const QSize& canvasSize);
+    QRect spectrogramRect(const QSize& canvasSize) const;
+    QRect histogramRect(const QSize& canvasSize) const;
+    int binToY(int numBins, const QRect& rect, double binIndex) const;
+    void handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize);
 
     LoiaconoRolling* transform_;
+    QWidget* canvas_ = nullptr;
     QImage image_;        // spectrogram backing store
     QTimer timer_;
+    bool hardwareAccelerationEnabled_ = false;
+    double displaySeconds_ = 8.0;
 
     // Gradient parameters
     float gain_ = 1.0f;   // pre-log multiplier
@@ -61,6 +87,8 @@ private:
     // FPS tracking
     int frameCount_ = 0;
     qint64 lastFpsTime_ = 0;
+    qint64 lastColumnTime_ = 0;
 
     static constexpr int HISTOGRAM_WIDTH = 120; // pixels for the histogram panel
+    static constexpr int AXIS_HEIGHT = 18;
 };
