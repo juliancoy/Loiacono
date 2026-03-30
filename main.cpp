@@ -222,17 +222,19 @@ int main(int argc, char* argv[])
 
     auto* devCombo = new QComboBox;
     devCombo->setStyleSheet(comboStyle);
-    auto* computeCombo = new QComboBox;
-    computeCombo->setStyleSheet(comboStyle);
-    computeCombo->addItem("Single-thread", static_cast<int>(LoiaconoRolling::ComputeMode::SingleThread));
-    computeCombo->addItem("Multi-thread", static_cast<int>(LoiaconoRolling::ComputeMode::MultiThread));
-    computeCombo->addItem("GPU compute", static_cast<int>(LoiaconoRolling::ComputeMode::GpuCompute));
-    computeCombo->setCurrentIndex(1);
-
-    auto* displayCombo = new QComboBox;
-    displayCombo->setStyleSheet(comboStyle);
-    displayCombo->addItem("CPU display", 0);
-    displayCombo->addItem("GPU display", 1);
+    auto* modeCombo = new QComboBox;
+    modeCombo->setStyleSheet(comboStyle);
+    auto addMode = [&](const QString& label, LoiaconoRolling::ComputeMode computeMode, bool gpuDisplay) {
+        int packed = (static_cast<int>(computeMode) << 1) | (gpuDisplay ? 1 : 0);
+        modeCombo->addItem(label, packed);
+    };
+    addMode("Single-thread + CPU display", LoiaconoRolling::ComputeMode::SingleThread, false);
+    addMode("Single-thread + GPU display", LoiaconoRolling::ComputeMode::SingleThread, true);
+    addMode("Multi-thread + CPU display", LoiaconoRolling::ComputeMode::MultiThread, false);
+    addMode("Multi-thread + GPU display", LoiaconoRolling::ComputeMode::MultiThread, true);
+    addMode("GPU compute + CPU display", LoiaconoRolling::ComputeMode::GpuCompute, false);
+    addMode("GPU compute + GPU display", LoiaconoRolling::ComputeMode::GpuCompute, true);
+    modeCombo->setCurrentIndex(2);
 
     auto addLabeledField = [&](const QString& labelText, QWidget* field) {
         auto* box = new QWidget;
@@ -247,8 +249,7 @@ int main(int argc, char* argv[])
     };
 
     row3Lay->addWidget(addLabeledField("Input device", devCombo), 1);
-    row3Lay->addWidget(addLabeledField("Compute mode", computeCombo));
-    row3Lay->addWidget(addLabeledField("Display mode", displayCombo));
+    row3Lay->addWidget(addLabeledField("Execution mode", modeCombo));
     mainLayout->addWidget(row3);
 
     // ── Spectrogram ──
@@ -298,20 +299,20 @@ int main(int argc, char* argv[])
         slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
     });
 
-    QObject::connect(displayCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [spectrogram, statusBar](int index) {
-        bool gpuDisplay = index == 1;
-        spectrogram->setHardwareAccelerationEnabled(gpuDisplay);
-        statusBar->showMessage(QString("Display mode: %1").arg(gpuDisplay ? "GPU display" : "CPU display"));
-    });
-    QObject::connect(computeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, statusBar, computeCombo](int index) {
-        auto mode = static_cast<LoiaconoRolling::ComputeMode>(computeCombo->itemData(index).toInt());
+    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo](int index) {
+        int packed = modeCombo->itemData(index).toInt();
+        auto mode = static_cast<LoiaconoRolling::ComputeMode>(packed >> 1);
+        bool gpuDisplay = (packed & 1) != 0;
         transform.setComputeMode(mode);
+        spectrogram->setHardwareAccelerationEnabled(gpuDisplay);
+
+        QString message = QString("Mode: %1").arg(modeCombo->itemText(index));
         if (mode == LoiaconoRolling::ComputeMode::GpuCompute && !transform.gpuComputeAvailable()) {
-            statusBar->showMessage("GPU compute selected, but no GPU compute backend is available yet; using multi-thread CPU");
-        } else {
-            statusBar->showMessage(QString("Compute mode: %1").arg(LoiaconoRolling::computeModeName(transform.activeComputeMode())));
+            message += " | GPU compute unavailable, using multi-thread CPU";
         }
+        statusBar->showMessage(message);
     });
+    modeCombo->setCurrentIndex(modeCombo->currentIndex());
 
     // ── Audio ──
     RtAudio adc;

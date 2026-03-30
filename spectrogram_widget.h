@@ -67,6 +67,7 @@ private:
     QRect histogramRect(const QSize& canvasSize) const;
     int binToY(int numBins, const QRect& rect, double binIndex) const;
     void handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize);
+    bool useDirectGpuPipeline() const;
 
     LoiaconoRolling* transform_;
     QWidget* canvas_ = nullptr;
@@ -88,6 +89,8 @@ private:
     int frameCount_ = 0;
     qint64 lastFpsTime_ = 0;
     qint64 lastColumnTime_ = 0;
+    int pendingGpuColumns_ = 0;
+    int historyRevision_ = 0;
 
     static constexpr int HISTOGRAM_WIDTH = 120; // pixels for the histogram panel
     static constexpr int AXIS_HEIGHT = 18;

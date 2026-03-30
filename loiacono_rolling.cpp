@@ -1,8 +1,11 @@
 #include "loiacono_rolling.h"
+#include "loiacono_gpu_compute.h"
 #include "loiacono_parallel.h"
 #include <algorithm>
 
 static constexpr double TWO_PI = 2.0 * M_PI;
+
+LoiaconoRolling::~LoiaconoRolling() = default;
 
 LoiaconoRolling::ComputeMode LoiaconoRolling::activeComputeMode() const
 {
@@ -23,6 +26,12 @@ const char* LoiaconoRolling::computeModeName(ComputeMode mode)
         return "gpu-compute";
     }
     return "unknown";
+}
+
+bool LoiaconoRolling::gpuComputeAvailable() const
+{
+    return (gpuRollingCompute_ && gpuRollingCompute_->available()) ||
+           (gpuCompute_ && gpuCompute_->available());
 }
 
 void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMax,
@@ -58,6 +67,17 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     ring_.assign(RING_SIZE, 0.0f);
     ringHead_ = 0;
     sampleCount_ = 0;
+    pendingGpuChunks_.clear();
+    pendingGpuChunksOverflowed_ = false;
+
+    if (!gpuCompute_) {
+        gpuCompute_ = std::make_unique<LoiaconoGpuCompute>();
+    }
+    if (!gpuRollingCompute_) {
+        gpuRollingCompute_ = std::make_unique<LoiaconoGpuRollingCompute>();
+    }
+    gpuRollingCompute_->configure(RING_SIZE, 2048, numBins_, freqs_, norms_, windowLens_);
+    gpuCompute_->configure(RING_SIZE, numBins_, multiple_, freqs_);
 }
 
 void LoiaconoRolling::processSample(float sample)
@@ -92,25 +112,50 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (activeComputeMode() == ComputeMode::SingleThread) {
+        ComputeMode mode = activeComputeMode();
+        if (mode == ComputeMode::GpuCompute) {
+            const int startRingHead = ringHead_;
+            const uint64_t startSampleCount = sampleCount_;
+            std::vector<float> oldSamples(static_cast<size_t>(count));
+            for (int i = 0; i < count; i++) {
+                oldSamples[static_cast<size_t>(i)] = ring_[(startRingHead + i) % RING_SIZE];
+            }
+            for (int i = 0; i < count; i++) {
+                ring_[(startRingHead + i) % RING_SIZE] = samples[i];
+            }
+            ringHead_ = (startRingHead + count) % RING_SIZE;
+            sampleCount_ += count;
+            GpuChunkDelta delta;
+            delta.newSamples.assign(samples, samples + count);
+            delta.oldSamples = std::move(oldSamples);
+            delta.startSampleCount = startSampleCount;
+            pendingGpuChunks_.push_back(std::move(delta));
+            while (pendingGpuChunks_.size() > MAX_PENDING_GPU_CHUNKS) {
+                pendingGpuChunks_.pop_front();
+                pendingGpuChunksOverflowed_ = true;
+            }
+            if (gpuRollingCompute_ && gpuRollingCompute_->available()) {
+                const auto& latest = pendingGpuChunks_.back();
+                gpuRollingCompute_->processChunk(
+                    latest.newSamples.data(),
+                    latest.oldSamples.data(),
+                    count,
+                    startSampleCount);
+            }
+        } else if (mode == ComputeMode::SingleThread) {
             for (int i = 0; i < count; i++) {
                 processSample(samples[i]);
             }
         } else {
-        const int startRingHead = ringHead_;
-        const uint64_t startSampleCount = sampleCount_;
+            const int startRingHead = ringHead_;
+            const uint64_t startSampleCount = sampleCount_;
 
-        for (int i = 0; i < count; i++) {
-            ring_[(startRingHead + i) % RING_SIZE] = samples[i];
-        }
-        ringHead_ = (startRingHead + count) % RING_SIZE;
-        sampleCount_ += count;
-
-        if (activeComputeMode() == ComputeMode::SingleThread) {
             for (int i = 0; i < count; i++) {
-                processSample(samples[i]);
+                ring_[(startRingHead + i) % RING_SIZE] = samples[i];
             }
-        } else {
+            ringHead_ = (startRingHead + count) % RING_SIZE;
+            sampleCount_ += count;
+
             loiacono::processBinsParallel(
                 workerCount_,
                 numBins_,
@@ -125,7 +170,6 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 Tr_,
                 Ti_);
         }
-        }
     }
 
     auto elapsed = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
@@ -138,6 +182,15 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (activeComputeMode() == ComputeMode::GpuCompute) {
+        if (gpuRollingCompute_ && gpuRollingCompute_->available() &&
+            gpuRollingCompute_->spectrum(out)) {
+            return;
+        }
+        if (gpuCompute_ && gpuCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), out)) {
+            return;
+        }
+    }
     out.resize(numBins_);
     for (int i = 0; i < numBins_; i++) {
         out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));
@@ -164,4 +217,33 @@ LoiaconoRolling::Stats LoiaconoRolling::getStats() const
     s.freqMin = numBins_ > 0 ? freqs_[0] * sampleRate_ : 0;
     s.freqMax = numBins_ > 0 ? freqs_[numBins_ - 1] * sampleRate_ : 0;
     return s;
+}
+
+LoiaconoRolling::GpuInputSnapshot LoiaconoRolling::gpuInputSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    GpuInputSnapshot snapshot;
+    snapshot.ring = ring_;
+    snapshot.freqs = freqs_;
+    snapshot.norms = norms_;
+    snapshot.windowLens = windowLens_;
+    snapshot.offset = static_cast<unsigned int>(ringHead_);
+    snapshot.sampleCount = sampleCount_;
+    snapshot.numBins = numBins_;
+    snapshot.multiple = multiple_;
+    return snapshot;
+}
+
+LoiaconoRolling::GpuChunkBatch LoiaconoRolling::takePendingGpuChunks()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    GpuChunkBatch batch;
+    batch.overflowed = pendingGpuChunksOverflowed_;
+    batch.chunks.reserve(pendingGpuChunks_.size());
+    while (!pendingGpuChunks_.empty()) {
+        batch.chunks.push_back(std::move(pendingGpuChunks_.front()));
+        pendingGpuChunks_.pop_front();
+    }
+    pendingGpuChunksOverflowed_ = false;
+    return batch;
 }

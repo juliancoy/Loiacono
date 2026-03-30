@@ -2,9 +2,13 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <chrono>
 #include <thread>
+#include <memory>
+#include "loiacono_gpu_compute.h"
+#include "loiacono_gpu_rolling_compute.h"
 
 class LoiaconoRolling {
 public:
@@ -15,6 +19,7 @@ public:
     };
 
     LoiaconoRolling() = default;
+    ~LoiaconoRolling();
 
     void configure(double sampleRate, double freqMin, double freqMax,
                    int numBins, int multiple);
@@ -32,7 +37,7 @@ public:
     ComputeMode computeMode() const { return computeMode_; }
     ComputeMode activeComputeMode() const;
     static const char* computeModeName(ComputeMode mode);
-    bool gpuComputeAvailable() const { return false; }
+    bool gpuComputeAvailable() const;
 
     // Runtime stats (thread-safe reads)
     struct Stats {
@@ -49,6 +54,29 @@ public:
         double freqMax = 0;
     };
     Stats getStats() const;
+
+    struct GpuInputSnapshot {
+        std::vector<float> ring;
+        std::vector<double> freqs;
+        std::vector<double> norms;
+        std::vector<int> windowLens;
+        unsigned int offset = 0;
+        uint64_t sampleCount = 0;
+        int numBins = 0;
+        int multiple = 0;
+    };
+    GpuInputSnapshot gpuInputSnapshot() const;
+
+    struct GpuChunkDelta {
+        std::vector<float> newSamples;
+        std::vector<float> oldSamples;
+        uint64_t startSampleCount = 0;
+    };
+    struct GpuChunkBatch {
+        std::vector<GpuChunkDelta> chunks;
+        bool overflowed = false;
+    };
+    GpuChunkBatch takePendingGpuChunks();
 
 private:
     double sampleRate_ = 48000;
@@ -74,6 +102,11 @@ private:
     uint64_t lastChunkSamples_ = 0;
     unsigned int workerCount_ = std::max(1u, std::thread::hardware_concurrency());
     ComputeMode computeMode_ = ComputeMode::MultiThread;
+    mutable std::unique_ptr<LoiaconoGpuCompute> gpuCompute_;
+    mutable std::unique_ptr<LoiaconoGpuRollingCompute> gpuRollingCompute_;
+    std::deque<GpuChunkDelta> pendingGpuChunks_;
+    bool pendingGpuChunksOverflowed_ = false;
+    static constexpr size_t MAX_PENDING_GPU_CHUNKS = 1024;
 
     mutable std::mutex mutex_;
 };

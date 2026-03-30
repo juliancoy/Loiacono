@@ -59,6 +59,7 @@ void SpectrogramWidget::setDisplayedTimeSeconds(double seconds)
 {
     displaySeconds_ = std::max(0.5, seconds);
     lastColumnTime_ = 0;
+    pendingGpuColumns_ = 0;
     update();
 }
 
@@ -66,6 +67,8 @@ void SpectrogramWidget::resetHistory()
 {
     image_.fill(Qt::black);
     lastColumnTime_ = 0;
+    pendingGpuColumns_ = 0;
+    historyRevision_++;
     if (canvas_) canvas_->update();
 }
 
@@ -109,6 +112,12 @@ int SpectrogramWidget::binToY(int numBins, const QRect& rect, double binIndex) c
     if (numBins <= 1) return rect.bottom();
     double t = std::clamp(binIndex / (numBins - 1.0), 0.0, 1.0);
     return rect.bottom() - static_cast<int>(std::lround(t * (rect.height() - 1)));
+}
+
+bool SpectrogramWidget::useDirectGpuPipeline() const
+{
+    return hardwareAccelerationEnabled_ &&
+           transform_->activeComputeMode() == LoiaconoRolling::ComputeMode::GpuCompute;
 }
 
 void SpectrogramWidget::handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize)
@@ -194,16 +203,23 @@ void SpectrogramWidget::tick()
         newImage.fill(Qt::black);
         image_ = newImage;
         lastColumnTime_ = 0;
+        pendingGpuColumns_ = 0;
+        historyRevision_++;
     }
 
-    transform_->getSpectrum(spectrum_);
+    if (!useDirectGpuPipeline()) {
+        transform_->getSpectrum(spectrum_);
+    }
 
-    float currentMax = 0;
+    float currentMax = frameStats_.peakAmp;
     int peakIdx = 0;
-    for (int i = 0; i < static_cast<int>(spectrum_.size()); i++) {
-        if (spectrum_[i] > currentMax) {
-            currentMax = spectrum_[i];
-            peakIdx = i;
+    if (!useDirectGpuPipeline()) {
+        currentMax = 0;
+        for (int i = 0; i < static_cast<int>(spectrum_.size()); i++) {
+            if (spectrum_[i] > currentMax) {
+                currentMax = spectrum_[i];
+                peakIdx = i;
+            }
         }
     }
     if (currentMax > maxAmplitude_) {
@@ -225,8 +241,9 @@ void SpectrogramWidget::tick()
     if (columnsToAdvance > 0) {
         lastColumnTime_ = wallNow;
     }
+    pendingGpuColumns_ = useDirectGpuPipeline() ? columnsToAdvance : 0;
 
-    if (columnsToAdvance > 0) {
+    if (columnsToAdvance > 0 && !useDirectGpuPipeline()) {
         for (int y = 0; y < h; y++) {
             auto* line = reinterpret_cast<QRgb*>(image_.scanLine(y));
             if (columnsToAdvance < w) {
@@ -235,7 +252,7 @@ void SpectrogramWidget::tick()
         }
     }
 
-    if (columnsToAdvance > 0) {
+    if (columnsToAdvance > 0 && !useDirectGpuPipeline()) {
         for (int fi = 0; fi < nb && fi < h; fi++) {
             int row = h - 1 - fi;
             auto [r, g, b] = colormap(spectrum_[fi]);
@@ -253,9 +270,11 @@ void SpectrogramWidget::tick()
         frameCount_ = 0;
         lastFpsTime_ = now;
     }
-    frameStats_.peakHz = nb > 0 ? transform_->binFreqHz(peakIdx) : 0;
-    frameStats_.peakAmp = currentMax;
-    frameStats_.maxAmp = maxAmplitude_;
+    if (!useDirectGpuPipeline()) {
+        frameStats_.peakHz = nb > 0 ? transform_->binFreqHz(peakIdx) : 0;
+        frameStats_.peakAmp = currentMax;
+        frameStats_.maxAmp = maxAmplitude_;
+    }
 
     if (auto* glCanvas = dynamic_cast<GlSpectrogramCanvas*>(canvas_)) {
         glCanvas->requestRepaint();
@@ -334,10 +353,10 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     auto stats = transform_->getStats();
     QFont monoFont("Menlo", 9);
     p.setFont(monoFont);
+    bool directGpu = useDirectGpuPipeline();
 
     QStringList lines;
     lines << QString("FPS: %1").arg(frameStats_.fps, 0, 'f', 0);
-    lines << QString("Peak: %1 Hz").arg(frameStats_.peakHz, 0, 'f', 0);
     lines << QString("Displayed: %1 s").arg(displaySeconds_, 0, 'f', 1);
     lines << QString("Render: %1").arg(hardwareAccelerationEnabled_ ? "GPU" : "CPU");
     lines << QString("CPU thr: %1").arg(transform_->cpuThreads());
@@ -345,6 +364,9 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     lines << QString("Bins: %1 x%2").arg(stats.currentBins).arg(stats.currentMultiple);
     lines << QString("CPU: %1%").arg(stats.cpuLoadPercent, 0, 'f', 1);
     lines << QString("%1 kS/s").arg(stats.samplesPerSecond / 1000.0, 0, 'f', 1);
+    if (!directGpu) {
+        lines.insert(1, QString("Peak: %1 Hz").arg(frameStats_.peakHz, 0, 'f', 0));
+    }
 
     int lineH = 13;
     int boxW = 136;
@@ -361,24 +383,26 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
         p.drawText(boxX + 4, boxY + 12 + i * lineH, lines[i]);
     }
 
-    int barH = 8;
-    int barY = std::max(4, spectRect.bottom() - barH - 1);
-    int barX = 4;
-    int barW2 = 200;
-    for (int i = 0; i < barW2; i++) {
-        float t = static_cast<float>(i) / barW2;
-        float amp = t * maxAmplitude_;
-        auto [cr, cg, cb] = colormap(amp);
-        p.setPen(QColor(cr, cg, cb));
-        p.drawLine(barX + i, barY, barX + i, barY + barH);
-    }
-    p.setPen(QColor(80, 80, 100));
-    p.drawRect(barX, barY, barW2, barH);
+    if (!directGpu) {
+        int barH = 8;
+        int barY = std::max(4, spectRect.bottom() - barH - 1);
+        int barX = 4;
+        int barW2 = 200;
+        for (int i = 0; i < barW2; i++) {
+            float t = static_cast<float>(i) / barW2;
+            float amp = t * maxAmplitude_;
+            auto [cr, cg, cb] = colormap(amp);
+            p.setPen(QColor(cr, cg, cb));
+            p.drawLine(barX + i, barY, barX + i, barY + barH);
+        }
+        p.setPen(QColor(80, 80, 100));
+        p.drawRect(barX, barY, barW2, barH);
 
-    p.setFont(smallFont);
-    p.setPen(QColor(100, 100, 130));
-    p.drawText(barX, barY - 2, QString("gain:%1 gamma:%2 floor:%3")
-               .arg(gain_, 0, 'f', 1).arg(gamma_, 0, 'f', 2).arg(floor_, 0, 'f', 2));
+        p.setFont(smallFont);
+        p.setPen(QColor(100, 100, 130));
+        p.drawText(barX, barY - 2, QString("gain:%1 gamma:%2 floor:%3")
+                   .arg(gain_, 0, 'f', 1).arg(gamma_, 0, 'f', 2).arg(floor_, 0, 'f', 2));
+    }
 
     int axisY = spectRect.bottom() + 1;
     p.fillRect(0, axisY, spectRect.width(), AXIS_HEIGHT, QColor(12, 12, 20));

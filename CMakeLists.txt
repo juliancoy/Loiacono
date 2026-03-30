@@ -16,6 +16,8 @@ add_subdirectory(rtaudio)
 add_executable(loiacono_spectrogram
     main.cpp
     gl_spectrogram_canvas.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
     loiacono_rolling.cpp
     loiacono_parallel.cpp
     spectrogram_widget.cpp
