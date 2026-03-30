@@ -12,7 +12,6 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     multiple_ = multiple;
     numBins_ = numBins;
 
-    // Build log-spaced frequency bins
     freqs_.resize(numBins);
     windowLens_.resize(numBins);
     norms_.resize(numBins);
@@ -26,18 +25,14 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
         double fNorm = fHz / sampleRate;
         freqs_[i] = fNorm;
 
-        // Window = multiple periods of this frequency
         int wlen = static_cast<int>(multiple / fNorm);
         wlen = std::min(wlen, RING_SIZE);
         windowLens_[i] = wlen;
         norms_[i] = 1.0 / std::sqrt(static_cast<double>(wlen));
     }
 
-    // Reset accumulators
     Tr_.assign(numBins, 0.0);
     Ti_.assign(numBins, 0.0);
-
-    // Reset ring buffer
     ring_.assign(RING_SIZE, 0.0f);
     ringHead_ = 0;
     sampleCount_ = 0;
@@ -45,25 +40,17 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
 
 void LoiaconoRolling::processSample(float sample)
 {
-    // Store new sample in ring buffer
     ring_[ringHead_] = sample;
 
-    // For each frequency bin: comb filter + resonator update
     for (int fi = 0; fi < numBins_; fi++) {
         double f = freqs_[fi];
         double norm = norms_[fi];
         int wlen = windowLens_[fi];
 
-        // Resonator: add new sample's contribution
-        //   Tr += x[n] * cos(2π·f·n) / sqrt(W)
-        //   Ti -= x[n] * sin(2π·f·n) / sqrt(W)
         double angle = TWO_PI * f * static_cast<double>(sampleCount_);
         Tr_[fi] += sample * std::cos(angle) * norm;
         Ti_[fi] -= sample * std::sin(angle) * norm;
 
-        // Comb filter: subtract oldest sample leaving the window
-        //   The sample that entered W steps ago is at ring[(head - W + RING_SIZE) % RING_SIZE]
-        //   Its phase was at (sampleCount_ - W)
         if (sampleCount_ >= static_cast<uint64_t>(wlen)) {
             int oldIdx = (ringHead_ - wlen + RING_SIZE) % RING_SIZE;
             float oldSample = ring_[oldIdx];
@@ -79,10 +66,20 @@ void LoiaconoRolling::processSample(float sample)
 
 void LoiaconoRolling::processChunk(const float* samples, int count)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (int i = 0; i < count; i++) {
-        processSample(samples[i]);
+    auto t0 = Clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (int i = 0; i < count; i++) {
+            processSample(samples[i]);
+        }
     }
+
+    auto elapsed = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+    chunkCount_++;
+    totalChunkMicros_ += elapsed;
+    lastChunkSamples_ = count;
+    if (elapsed > peakChunkMicros_) peakChunkMicros_ = elapsed;
 }
 
 void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
@@ -92,4 +89,26 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
     for (int i = 0; i < numBins_; i++) {
         out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));
     }
+}
+
+LoiaconoRolling::Stats LoiaconoRolling::getStats() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stats s;
+    s.totalSamples = sampleCount_;
+    s.totalChunks = chunkCount_;
+    auto now = Clock::now();
+    s.uptimeSeconds = std::chrono::duration<double>(now - startTime_).count();
+    s.samplesPerSecond = s.uptimeSeconds > 0 ? sampleCount_ / s.uptimeSeconds : 0;
+    s.avgChunkMicros = chunkCount_ > 0 ? totalChunkMicros_ / chunkCount_ : 0;
+    s.peakChunkMicros = peakChunkMicros_;
+    // CPU load: how much of the audio deadline does processChunk use?
+    // deadline = chunkSamples / sampleRate (in micros)
+    double deadlineMicros = (lastChunkSamples_ / sampleRate_) * 1e6;
+    s.cpuLoadPercent = deadlineMicros > 0 ? (s.avgChunkMicros / deadlineMicros) * 100.0 : 0;
+    s.currentBins = numBins_;
+    s.currentMultiple = multiple_;
+    s.freqMin = numBins_ > 0 ? freqs_[0] * sampleRate_ : 0;
+    s.freqMax = numBins_ > 0 ? freqs_[numBins_ - 1] * sampleRate_ : 0;
+    return s;
 }

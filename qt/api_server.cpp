@@ -189,6 +189,30 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             sendOk(socket, "Deleted profile: " + name);
         }
 
+    } else if (method == "GET" && path == "/api/runtime") {
+        auto stats = transform_->getStats();
+        auto fs = spectrogram_->frameStats();
+        sendJson(socket, 200, {
+            {"fps", fs.fps},
+            {"peakFrequencyHz", fs.peakHz},
+            {"peakAmplitude", static_cast<double>(fs.peakAmp)},
+            {"maxAmplitude", static_cast<double>(fs.maxAmp)},
+            {"totalSamples", static_cast<qint64>(stats.totalSamples)},
+            {"totalChunks", static_cast<qint64>(stats.totalChunks)},
+            {"uptimeSeconds", stats.uptimeSeconds},
+            {"samplesPerSecond", stats.samplesPerSecond},
+            {"avgChunkMicros", stats.avgChunkMicros},
+            {"peakChunkMicros", stats.peakChunkMicros},
+            {"cpuLoadPercent", stats.cpuLoadPercent},
+            {"currentBins", stats.currentBins},
+            {"currentMultiple", stats.currentMultiple},
+            {"freqMin", stats.freqMin},
+            {"freqMax", stats.freqMax},
+            {"gain", static_cast<double>(spectrogram_->gain())},
+            {"gamma", static_cast<double>(spectrogram_->gamma())},
+            {"floor", static_cast<double>(spectrogram_->floor())},
+        });
+
     } else if (method == "GET" && path == "/api/devices") {
         if (deviceListCb_) {
             sendJsonArray(socket, 200, deviceListCb_());

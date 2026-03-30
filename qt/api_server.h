@@ -29,6 +29,7 @@ class SpectrogramWidget;
 //   DELETE /api/profiles/:name       - delete a saved profile
 //   GET  /api/spectrum               - current spectrum as JSON array
 //   GET  /api/stream                 - MJPEG video stream (use in <img> tag)
+//   GET  /api/runtime                - runtime stats (fps, cpu load, samples/sec)
 //   GET  /api/devices                - list audio input devices
 //   PUT  /api/device                 - switch audio input device {"id": 131}
 
