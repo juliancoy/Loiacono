@@ -51,6 +51,8 @@ signals:
     void frequencyRangeChanged(int freqMin, int freqMax);
 
 protected:
+    void resizeEvent(QResizeEvent* event) override;
+    
 private slots:
     void tick();
 
@@ -96,4 +98,5 @@ private:
 
     static constexpr int HISTOGRAM_WIDTH = 120; // pixels for the histogram panel
     static constexpr int AXIS_HEIGHT = 18;
+    static constexpr int Y_AXIS_WIDTH = 50;   // pixels for frequency labels column
 };

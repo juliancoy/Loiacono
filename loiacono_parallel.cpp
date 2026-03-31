@@ -23,7 +23,8 @@ void processBinsParallel(
     const std::vector<double>& norms,
     const std::vector<int>& windowLens,
     std::vector<double>& tr,
-    std::vector<double>& ti)
+    std::vector<double>& ti,
+    double leakiness)
 {
     auto processBinRange = [&](int begin, int end) {
         for (int fi = begin; fi < end; fi++) {
@@ -32,6 +33,12 @@ void processBinsParallel(
             double f = freqs[fi];
             double norm = norms[fi];
             int wlen = windowLens[fi];
+
+            // Apply leakiness once for the whole chunk (not per-sample)
+            // leakiness^count approximates applying it count times
+            double chunkLeak = std::pow(leakiness, count);
+            trValue *= chunkLeak;
+            tiValue *= chunkLeak;
 
             for (int i = 0; i < count; i++) {
                 uint64_t sampleIdx = startSampleCount + i;

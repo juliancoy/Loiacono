@@ -19,6 +19,8 @@ protected:
     void paintEvent(QPaintEvent*) override
     {
         QPainter p(this);
+        // RED background to clearly see canvas bounds
+        p.fillRect(rect(), Qt::red);
         owner_->paintContent(p, size());
     }
 
@@ -41,6 +43,7 @@ SpectrogramWidget::SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent
     : QWidget(parent), transform_(transform)
 {
     setMinimumSize(600, 300);
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);  // Fill available space
 
     auto* layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -82,21 +85,39 @@ void SpectrogramWidget::resetHistory()
 
 void SpectrogramWidget::onCanvasResized()
 {
+    if (!canvas_) return;
+    
     QRect spectRect = spectrogramRect(canvas_->size());
+    
     
     // Resize the image to match new canvas size
     if (image_.width() != spectRect.width() || image_.height() != spectRect.height()) {
-        QImage newImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
-        newImage.fill(Qt::black);
-        image_ = newImage;
+        // Start fresh with a black image - don't copy old data because the
+        // vertical scaling may have changed (bins need to stretch to new height)
+        image_ = QImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
+        image_.fill(Qt::black);
     }
+    
+    // Trigger repaint after image is resized
+    canvas_->update();
     
     lastColumnSampleCount_ = transform_->getStats().totalSamples;
     pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
     historyRevision_++;
     
-    if (canvas_) canvas_->update();
+    canvas_->update();
+}
+
+void SpectrogramWidget::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    
+    // Resize the image to match new size and trigger repaint
+    if (canvas_) {
+        onCanvasResized();
+        // onCanvasResized now calls canvas_->update() after resizing the image
+    }
 }
 
 void SpectrogramWidget::replaceCanvas()
@@ -118,14 +139,17 @@ void SpectrogramWidget::replaceCanvas()
         canvas_ = new RasterCanvas(this);
     }
 
-    layout->addWidget(canvas_);
-    canvas_->setMinimumSize(600, 300);
+    layout->addWidget(canvas_, 1);  // Add with stretch factor 1 to fill space
+    canvas_->setMinimumSize(100, 100);  // Lower minimum to allow flexibility
     canvas_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
 QRect SpectrogramWidget::spectrogramRect(const QSize& canvasSize) const
 {
-    return QRect(0, 0, std::max(1, canvasSize.width() - HISTOGRAM_WIDTH), std::max(1, canvasSize.height() - AXIS_HEIGHT));
+    // Reserve space on left for Y-axis (frequency labels) and on right for histogram
+    int w = std::max(1, canvasSize.width() - HISTOGRAM_WIDTH - Y_AXIS_WIDTH);
+    int h = std::max(1, canvasSize.height() - AXIS_HEIGHT);
+    return QRect(Y_AXIS_WIDTH, 0, w, h);
 }
 
 QRect SpectrogramWidget::histogramRect(const QSize& canvasSize) const
@@ -226,23 +250,21 @@ void SpectrogramWidget::tick()
     QRect spectRect = spectrogramRect(canvas_->size());
 
     if (image_.width() != spectRect.width() || image_.height() != spectRect.height()) {
-        // Resize happened - onCanvasResized() will handle the reset
-        // Just resize the image here, reset is done in resize handler
-        QImage newImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
-        newImage.fill(Qt::black);
-        image_ = newImage;
+        // Resize happened - start fresh with correct vertical scaling
+        image_ = QImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
+        image_.fill(Qt::black);
         lastColumnSampleCount_ = transform_->getStats().totalSamples;
         pendingColumnFraction_ = 0.0;
         pendingGpuColumns_ = 0;
         historyRevision_++;
     }
 
-    if (!useDirectGpuPipeline()) {
-        transform_->getSpectrum(spectrum_);
-    }
+    // Always fetch spectrum for histogram display (even in GPU modes)
+    transform_->getSpectrum(spectrum_);
 
     float currentMax = frameStats_.peakAmp;
     int peakIdx = 0;
+    // In GPU modes, peak is computed on GPU. In CPU modes, compute it here.
     if (!useDirectGpuPipeline()) {
         currentMax = 0;
         for (int i = 0; i < static_cast<int>(spectrum_.size()); i++) {
@@ -288,8 +310,11 @@ void SpectrogramWidget::tick()
     }
 
     if (columnsToAdvance > 0 && !useDirectGpuPipeline()) {
-        for (int fi = 0; fi < nb && fi < h; fi++) {
-            int row = h - 1 - fi;
+        // Map frequency bins to image rows, stretching to fill full height
+        for (int row = 0; row < h; row++) {
+            // Map row to bin index (inverted: row 0 is top = highest frequency)
+            double binF = (nb - 1) * (h - 1 - row) / std::max(1, h - 1);
+            int fi = static_cast<int>(std::clamp(std::floor(binF), 0.0, static_cast<double>(nb - 1)));
             auto [r, g, b] = colormap(spectrum_[fi]);
             auto* line = reinterpret_cast<QRgb*>(image_.scanLine(row));
             for (int x = w - columnsToAdvance; x < w; x++) {
@@ -356,32 +381,54 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
 
     QRect spectRect = spectrogramRect(canvasSize);
     QRect histRect = histogramRect(canvasSize);
+    
+    // Y-axis column rect (frequency labels area)
+    QRect yAxisRect(0, spectRect.top(), Y_AXIS_WIDTH - 5, spectRect.height());
 
     p.setRenderHint(QPainter::TextAntialiasing, true);
-    p.setPen(QColor(140, 140, 180));
-    QFont smallFont = p.font();
-    smallFont.setPixelSize(10);
-    p.setFont(smallFont);
+    
+    // Draw Y-axis background
+    p.fillRect(yAxisRect.adjusted(-2, 0, 2, 0), QColor(12, 12, 20));
+    
+    // Draw separator line between Y-axis and spectrogram
+    p.setPen(QColor(50, 50, 70));
+    p.drawLine(Y_AXIS_WIDTH - 3, spectRect.top(), Y_AXIS_WIDTH - 3, spectRect.bottom());
 
     double fMin = transform_->binFreqHz(0);
     double fMax = transform_->binFreqHz(nb - 1);
     double logMin = std::log(fMin);
     double logRange = std::max(0.0001, std::log(fMax) - logMin);
 
+    // Draw frequency labels in the Y-axis column
+    QFont labelFont = p.font();
+    labelFont.setPixelSize(10);
+    p.setFont(labelFont);
+    
     const double labelFreqs[] = {50, 100, 200, 440, 500, 1000, 2000, 3000, 5000, 8000, 10000};
     for (double f : labelFreqs) {
         if (f < fMin || f > fMax) continue;
         double logPos = (std::log(f) - logMin) / logRange;
         int y = binToY(nb, spectRect, logPos * (nb - 1));
-        QString label = f >= 1000 ? QString("%1k").arg(f / 1000.0, 0, 'g', 3)
+        QString label = f >= 1000 ? QString("%1k").arg(f / 1000.0, 0, 'f', 1)
                                   : QString::number(static_cast<int>(f));
-        p.setPen(QColor(60, 60, 80));
-        p.drawLine(spectRect.left(), y, histRect.right(), y);
-        p.setPen(QColor(140, 140, 180));
-        p.drawText(4, std::max(10, y - 2), label);
+        
+        // Draw horizontal grid line across spectrogram only
+        p.setPen(QColor(40, 40, 60));
+        p.drawLine(spectRect.left(), y, spectRect.right(), y);
+        
+        // Draw tick mark on the separator line
+        p.setPen(QColor(100, 100, 130));
+        p.drawLine(Y_AXIS_WIDTH - 6, y, Y_AXIS_WIDTH - 3, y);
+        
+        // Draw label right-aligned in Y-axis column
+        QFontMetrics fm(labelFont);
+        int textW = fm.horizontalAdvance(label);
+        p.setPen(QColor(200, 200, 230));  // Brighter text
+        p.drawText(Y_AXIS_WIDTH - 8 - textW, y + 4, label);
     }
 
-    p.fillRect(histRect.adjusted(-1, 0, 1, 0), QColor(0, 0, 0, 0));
+    // Histogram background
+    p.fillRect(histRect.adjusted(-1, 0, 1, 0), QColor(12, 12, 20));
     p.setPen(QColor(30, 30, 50));
     p.drawLine(histRect.left() - 1, spectRect.top(), histRect.left() - 1, spectRect.bottom());
 
@@ -421,7 +468,7 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     if (!directGpu) {
         int barH = 8;
         int barY = std::max(4, spectRect.bottom() - barH - 1);
-        int barX = 4;
+        int barX = Y_AXIS_WIDTH + 4;  // Move to right of Y-axis column
         int barW2 = 200;
         for (int i = 0; i < barW2; i++) {
             float t = static_cast<float>(i) / barW2;
@@ -433,6 +480,8 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
         p.setPen(QColor(80, 80, 100));
         p.drawRect(barX, barY, barW2, barH);
 
+        QFont smallFont = p.font();
+        smallFont.setPixelSize(10);
         p.setFont(smallFont);
         p.setPen(QColor(100, 100, 130));
         p.drawText(barX, barY - 2, QString("gain:%1 gamma:%2 floor:%3")
@@ -440,13 +489,13 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     }
 
     int axisY = spectRect.bottom() + 1;
-    p.fillRect(0, axisY, spectRect.width(), AXIS_HEIGHT, QColor(12, 12, 20));
-    p.fillRect(histRect.left() - 1, axisY, HISTOGRAM_WIDTH, AXIS_HEIGHT, QColor(12, 12, 20));
+    // X-axis background (dark) - covers full width including Y-axis column
+    p.fillRect(0, axisY, canvasSize.width(), AXIS_HEIGHT, QColor(12, 12, 20));
     p.setPen(QColor(35, 35, 55));
     p.drawLine(0, axisY, histRect.right(), axisY);
 
     p.setPen(QColor(120, 120, 150));
-    p.drawText(4, axisY + 12, "Time (s)");
+    p.drawText(Y_AXIS_WIDTH, axisY + 12, "Time (s)");
 
     int maxWholeSeconds = std::max(1, static_cast<int>(std::floor(displaySeconds_)));
     for (int second = 0; second <= maxWholeSeconds; ++second) {
@@ -470,8 +519,10 @@ void SpectrogramWidget::paintContent(QPainter& p, const QSize& canvasSize)
     QRect spectRect = spectrogramRect(canvasSize);
     QRect histRect = histogramRect(canvasSize);
 
+    // Background for canvas area
     p.fillRect(QRect(QPoint(0, 0), canvasSize), QColor(10, 10, 16));
     p.drawImage(spectRect, image_);
+    // Histogram background (dark)
     p.fillRect(histRect.adjusted(-1, 0, 1, 0), QColor(12, 12, 20));
 
     if (!spectrum_.empty() && maxAmplitude_ > 0) {

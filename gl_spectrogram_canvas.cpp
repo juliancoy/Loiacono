@@ -237,6 +237,7 @@ void GlSpectrogramCanvas::initializeGL()
         uniform int numBins;
         uniform uint sampleBase;
         uniform int ringHeadStart;
+        uniform float leakiness;
         shared float sharedTr[128];
         shared float sharedTi[128];
         void main() {
@@ -246,6 +247,7 @@ void GlSpectrogramCanvas::initializeGL()
             float freq = freqs[bin];
             float norm = norms[bin];
             int windowLen = windowLens[bin];
+            float chunkLeak = pow(leakiness, float(chunkLength));
             float tr = 0.0;
             float ti = 0.0;
             for (int i = int(tid); i < chunkLength; i += 128) {
@@ -273,8 +275,8 @@ void GlSpectrogramCanvas::initializeGL()
                 barrier();
             }
             if (tid == 0u) {
-                trState[bin] += sharedTr[0];
-                tiState[bin] += sharedTi[0];
+                trState[bin] = trState[bin] * chunkLeak + sharedTr[0];
+                tiState[bin] = tiState[bin] * chunkLeak + sharedTi[0];
             }
         }
     )");
@@ -410,9 +412,17 @@ void GlSpectrogramCanvas::paintGL()
 
     glViewport(0, 0, width(), height());
     glDisable(GL_DEPTH_TEST);
-    // RED background to clearly see the canvas bounds
-    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+    // Dark background
+    glClearColor(10.0f / 255.0f, 10.0f / 255.0f, 16.0f / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
+
+    // Ensure image is resized before painting
+    QImage img = owner_->spectrogramImage();
+    if (img.width() != spectRect.width() || img.height() != spectRect.height()) {
+        owner_->onCanvasResized();
+        spectRect = owner_->spectrogramRect(size());
+        histRect = owner_->histogramRect(size());
+    }
 
     if (owner_->useDirectGpuPipeline()) {
         paintDirectGpuPath(spectRect, histRect);
@@ -427,6 +437,8 @@ void GlSpectrogramCanvas::paintGL()
 void GlSpectrogramCanvas::resizeEvent(QResizeEvent* event)
 {
     QOpenGLWidget::resizeEvent(event);
+    // Don't call update() here - parent will handle it after resizing the image
+    // Just notify the parent that resize happened
     owner_->onCanvasResized();
 }
 
@@ -593,7 +605,7 @@ void GlSpectrogramCanvas::drawHistogram(const QRect& rect, QOpenGLTexture* ampli
     histogramProgram_.setUniformValue("rectTransform", rectTransform(rect));
     histogramProgram_.setUniformValue("amplitudeTex", 0);
     histogramProgram_.setUniformValue("colorTex", 1);
-    histogramProgram_.setUniformValue("backgroundColor", QVector4D(12.0f / 255.0f, 12.0f / 255.0f, 20.0f / 255.0f, 1.0f));
+    histogramProgram_.setUniformValue("backgroundColor", QVector4D(20.0f / 255.0f, 20.0f / 255.0f, 35.0f / 255.0f, 1.0f));  // Dark blue-gray background
     amplitudeTexture->bind(0);
     colorTexture->bind(1);
     bindQuad(histogramProgram_);
@@ -745,6 +757,7 @@ bool GlSpectrogramCanvas::runDirectRollingUpdates(const LoiaconoRolling::GpuChun
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, directBuffers_[DIRECT_BUF_TR]);
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, directBuffers_[DIRECT_BUF_TI]);
     directRollingUpdateProgram_.setUniformValue("numBins", directNumBins_);
+    directRollingUpdateProgram_.setUniformValue("leakiness", static_cast<float>(owner_->transform_->leakiness()));
     for (const auto& chunk : batch.chunks) {
         const int count = static_cast<int>(chunk.newSamples.size());
         if (count <= 0) continue;

@@ -19,7 +19,8 @@ public:
     bool processChunk(const float* newSamples,
                       int count,
                       std::uint64_t startSampleCount,
-                      int ringHeadStart);
+                      int ringHeadStart,
+                      double leakiness = 1.0);
     bool spectrum(std::vector<float>& outSpectrum) const;
 
 private:

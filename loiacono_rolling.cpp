@@ -1,7 +1,28 @@
+// Loiacono Rolling-Window Spectrogram
+// 
+// This implements a rolling-window variant of the Goertzel algorithm for
+// efficient time-frequency analysis. Unlike the standard DFT/FFT which
+// processes fixed blocks, this approach maintains running sums that are
+// updated incrementally as new samples arrive.
+//
+// Key features:
+// - Constant-Q frequency bins (logarithmically spaced, with window sizes
+//   inversely proportional to frequency)
+// - Goertzel-based complex coefficient computation with proper amplitude
+//   scaling (1/sqrt(window_size) normalization)
+// - Rolling window: subtracts samples as they leave the window, providing
+//   sliding-window spectral estimates without block artifacts
+// - Multiple compute modes: single-threaded, multi-threaded, and GPU-accelerated
+//
+// The algorithm is particularly efficient when many frequency bins are needed
+// at fine time resolution, as each bin is computed independently with O(1)
+// update per sample.
+
 #include "loiacono_rolling.h"
 #include "loiacono_gpu_compute.h"
 #include "loiacono_parallel.h"
 #include <algorithm>
+#include <QDebug>
 
 static constexpr double TWO_PI = 2.0 * M_PI;
 
@@ -51,6 +72,9 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     double logMax = std::log(freqMax);
     double logStep = (logMax - logMin) / numBins;
 
+    // Configure bins with Goertzel scaling:
+    // - Window length scales inversely with frequency (constant Q)
+    // - Normalization scales as 1/sqrt(window_length) for amplitude consistency
     for (int i = 0; i < numBins; i++) {
         double fHz = std::exp(logMin + i * logStep);
         double fNorm = fHz / sampleRate;
@@ -59,6 +83,7 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
         int wlen = static_cast<int>(multiple / fNorm);
         wlen = std::min(wlen, RING_SIZE);
         windowLens_[i] = wlen;
+        // Goertzel amplitude scaling: 1/sqrt(N) to normalize for window size
         norms_[i] = 1.0 / std::sqrt(static_cast<double>(wlen));
     }
 
@@ -89,10 +114,27 @@ void LoiaconoRolling::processSample(float sample)
         double norm = norms_[fi];
         int wlen = windowLens_[fi];
 
+        // Apply leakiness factor per sample (correct for single-sample processing)
+        Tr_[fi] *= leakiness_;
+        Ti_[fi] *= leakiness_;
+
+        // Rolling Goertzel recurrence:
+        // The Goertzel algorithm computes DFT coefficients efficiently using a
+        // second-order IIR filter. We use a complex-valued form that maintains
+        // (Tr, Ti) as the accumulated complex Fourier coefficient.
+        // 
+        // For each sample x[n] at time n with normalized frequency f:
+        //   s[n] = x[n] + 2*cos(2πf)*s[n-1] - s[n-2]  (standard recurrence)
+        //   y[n] = s[n] - exp(-j*2πf)*s[n-1]          (output)
+        //
+        // Our implementation uses a direct complex accumulation:
+        //   Tr += x[n] * cos(2πf*n) * norm  (real part with amplitude scaling)
+        //   Ti -= x[n] * sin(2πf*n) * norm  (imaginary part with amplitude scaling)
         double angle = TWO_PI * f * static_cast<double>(sampleCount_);
         Tr_[fi] += sample * std::cos(angle) * norm;
         Ti_[fi] -= sample * std::sin(angle) * norm;
 
+        // Rolling window: subtract the sample that just left the window
         if (sampleCount_ >= static_cast<uint64_t>(wlen)) {
             int oldIdx = (ringHead_ - wlen + RING_SIZE) % RING_SIZE;
             float oldSample = ring_[oldIdx];
@@ -138,6 +180,7 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 processSample(samples[i]);
             }
         } else {
+            // Multi-thread mode
             const int startRingHead = ringHead_;
             const uint64_t startSampleCount = sampleCount_;
 
@@ -159,7 +202,8 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 norms_,
                 windowLens_,
                 Tr_,
-                Ti_);
+                Ti_,
+                leakiness_);
         }
     }
 
@@ -173,15 +217,39 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    
     if (activeComputeMode() == ComputeMode::GpuCompute) {
-        if (gpuRollingCompute_ && gpuRollingCompute_->available() &&
-            gpuRollingCompute_->spectrum(out)) {
-            return;
+        // In CPU display mode, we need to process pending chunks before reading spectrum
+        // because the GPU paint path won't be called
+        if (!pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
+            // Take chunks and process them (need to cast away const for modification)
+            auto& chunks = const_cast<std::deque<GpuChunkDelta>&>(pendingGpuChunks_);
+            auto& overflowed = const_cast<bool&>(pendingGpuChunksOverflowed_);
+            
+            while (!chunks.empty()) {
+                const auto& delta = chunks.front();
+                gpuRollingCompute_->processChunk(delta.newSamples.data(), 
+                                                 static_cast<int>(delta.newSamples.size()),
+                                                 delta.startSampleCount,
+                                                 delta.ringHeadStart,
+                                                 leakiness_);
+                chunks.pop_front();
+            }
+            overflowed = false;
         }
+        
+        if (gpuRollingCompute_ && gpuRollingCompute_->available()) {
+            if (gpuRollingCompute_->spectrum(out)) {
+                return;
+            }
+        }
+        
         if (gpuCompute_ && gpuCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), out)) {
             return;
         }
     }
+    
+    // CPU fallback (used by SingleThread and MultiThread modes)
     out.resize(numBins_);
     for (int i = 0; i < numBins_; i++) {
         out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));

@@ -7,6 +7,7 @@
 #include <QMainWindow>
 #include <QLayout>
 #include <QWindow>
+#include <QScreen>
 
 static const char* APP_VERSION = "1.0.0";
 

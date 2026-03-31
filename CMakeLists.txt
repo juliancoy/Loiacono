@@ -73,3 +73,39 @@ target_link_libraries(test_simple_consistency PRIVATE
 target_include_directories(test_simple_consistency PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
 )
+
+# Headless test (no GUI/OpenGL required)
+add_executable(test_modes_headless
+    tests/test_modes_headless.cpp
+    loiacono_rolling.cpp
+    loiacono_parallel.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
+)
+
+target_link_libraries(test_modes_headless PRIVATE
+    Qt6::Core
+    Qt6::OpenGLWidgets
+)
+
+target_include_directories(test_modes_headless PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)
+
+# Display consistency test (generates images for comparison)
+add_executable(test_display_consistency
+    tests/test_display_consistency.cpp
+    loiacono_rolling.cpp
+    loiacono_parallel.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
+)
+
+target_link_libraries(test_display_consistency PRIVATE
+    Qt6::Widgets
+    Qt6::OpenGLWidgets
+)
+
+target_include_directories(test_display_consistency PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)

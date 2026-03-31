@@ -2,6 +2,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <deque>
 #include <mutex>
 #include <chrono>
@@ -9,6 +10,17 @@
 #include <memory>
 #include "loiacono_gpu_compute.h"
 #include "loiacono_gpu_rolling_compute.h"
+
+// Loiacono Transform - A sliding-window variation of the Goertzel algorithm
+// 
+// This is essentially the Goertzel algorithm scaled in both amplitude and window size:
+// - Amplitude scaling: Each bin is normalized by 1/sqrt(window_length) to make
+//   the output amplitude independent of window size
+// - Window size: Each frequency bin uses a window length proportional to 
+//   (multiple / frequency), giving consistent frequency resolution across the spectrum
+//
+// The algorithm maintains running sums (Tr, Ti) for each frequency bin, updated
+// incrementally as new samples arrive and old samples exit the window.
 
 class LoiaconoRolling {
 public:
@@ -35,6 +47,10 @@ public:
     unsigned int cpuThreads() const { return workerCount_; }
     void setComputeMode(ComputeMode mode) { computeMode_ = mode; }
     ComputeMode computeMode() const { return computeMode_; }
+    
+    // Leakiness factor: 1.0 = no leakage, 0.9999 = 0.01% leakage per sample
+    void setLeakiness(double leak) { leakiness_ = std::clamp(leak, 0.99, 1.0); }
+    double leakiness() const { return leakiness_; }
     ComputeMode activeComputeMode() const;
     static const char* computeModeName(ComputeMode mode);
     bool gpuComputeAvailable() const;
@@ -102,6 +118,7 @@ private:
     uint64_t lastChunkSamples_ = 0;
     unsigned int workerCount_ = std::max(1u, std::thread::hardware_concurrency());
     ComputeMode computeMode_ = ComputeMode::MultiThread;
+    double leakiness_ = 0.99995;  // Default: 0.005% leakage per sample
     mutable std::unique_ptr<LoiaconoGpuCompute> gpuCompute_;
     mutable std::unique_ptr<LoiaconoGpuRollingCompute> gpuRollingCompute_;
     std::deque<GpuChunkDelta> pendingGpuChunks_;

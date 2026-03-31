@@ -29,6 +29,7 @@ const char* kRollingUpdateShader = R"(
     uniform int numBins;
     uniform uint sampleBase;
     uniform int ringHeadStart;
+    uniform float leakiness;
 
     shared float sharedTr[128];
     shared float sharedTi[128];
@@ -43,6 +44,8 @@ const char* kRollingUpdateShader = R"(
         float norm = norms[bin];
         int windowLen = windowLens[bin];
 
+        // Apply leakiness factor: pow(leakiness, chunkLength) to match CPU behavior
+        float chunkLeak = pow(leakiness, float(chunkLength));
         float tr = 0.0;
         float ti = 0.0;
         for (int i = int(tid); i < chunkLength; i += 128) {
@@ -75,8 +78,8 @@ const char* kRollingUpdateShader = R"(
         }
 
         if (tid == 0u) {
-            trState[bin] += sharedTr[0];
-            tiState[bin] += sharedTi[0];
+            trState[bin] = trState[bin] * chunkLeak + sharedTr[0];
+            tiState[bin] = tiState[bin] * chunkLeak + sharedTi[0];
         }
     }
 )";
@@ -150,7 +153,8 @@ public:
     bool processChunk(const float* newSamples,
                       int count,
                       std::uint64_t startSampleCount,
-                      int ringHeadStart)
+                      int ringHeadStart,
+                      double leakiness)
     {
         if (!initialized_ || count <= 0 || count > maxChunkLength_) return false;
         
@@ -185,6 +189,7 @@ public:
         f->glUniform1ui(f->glGetUniformLocation(updateProgram_, "sampleBase"),
                         static_cast<GLuint>(startSampleCount & 0xffffffffu));
         f->glUniform1i(f->glGetUniformLocation(updateProgram_, "ringHeadStart"), ringHeadStart);
+        f->glUniform1f(f->glGetUniformLocation(updateProgram_, "leakiness"), static_cast<float>(leakiness));
 
         f->glDispatchCompute(static_cast<GLuint>(numBins_), 1, 1);
         f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -425,9 +430,10 @@ bool LoiaconoGpuRollingCompute::configure(int signalLength,
 bool LoiaconoGpuRollingCompute::processChunk(const float* newSamples,
                                              int count,
                                              std::uint64_t startSampleCount,
-                                             int ringHeadStart)
+                                             int ringHeadStart,
+                                             double leakiness)
 {
-    return impl_->processChunk(newSamples, count, startSampleCount, ringHeadStart);
+    return impl_->processChunk(newSamples, count, startSampleCount, ringHeadStart, leakiness);
 }
 
 bool LoiaconoGpuRollingCompute::spectrum(std::vector<float>& outSpectrum) const

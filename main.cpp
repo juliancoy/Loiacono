@@ -2,6 +2,7 @@
 #include <QMainWindow>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QScreen>
 #include <QSlider>
 #include <QLabel>
 #include <QPushButton>
@@ -40,6 +41,7 @@ struct SavedUiState {
     int gainTenths = 10;
     int gammaHundredths = 60;
     int floorHundredths = 5;
+    int leakinessHundredths = 9995;  // 0.05% leakage (0.9995)
     int displayTenths = 80;
     int modeIndex = 2;
     int deviceId = -1;
@@ -68,6 +70,7 @@ static SavedUiState loadSavedUiState()
     state.gainTenths = obj.value("gainTenths").toInt(state.gainTenths);
     state.gammaHundredths = obj.value("gammaHundredths").toInt(state.gammaHundredths);
     state.floorHundredths = obj.value("floorHundredths").toInt(state.floorHundredths);
+    state.leakinessHundredths = obj.value("leakinessHundredths").toInt(state.leakinessHundredths);
     state.displayTenths = obj.value("displayTenths").toInt(state.displayTenths);
     state.modeIndex = obj.value("modeIndex").toInt(state.modeIndex);
     state.deviceId = obj.value("deviceId").toInt(state.deviceId);
@@ -84,6 +87,7 @@ static void saveUiState(const SavedUiState& state)
         {"gainTenths", state.gainTenths},
         {"gammaHundredths", state.gammaHundredths},
         {"floorHundredths", state.floorHundredths},
+        {"leakinessHundredths", state.leakinessHundredths},
         {"displayTenths", state.displayTenths},
         {"modeIndex", state.modeIndex},
         {"deviceId", state.deviceId},
@@ -233,14 +237,29 @@ int main(int argc, char* argv[])
     SavedUiState savedState = loadSavedUiState();
     int freqMin = std::clamp(savedState.freqMin, 20, 2000);
     int freqMax = std::clamp(savedState.freqMax, 500, 12000);
-    int numBins = std::clamp(savedState.bins, 32, 600);
+    int numBins = std::clamp(savedState.bins, 32, 1200);
     int multiple = std::clamp(savedState.multiple, 2, 120);
     if (freqMin >= freqMax - 50) freqMax = std::min(12000, freqMin + 50);
     transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
 
     auto* window = new QMainWindow;
     window->setWindowTitle("Loiacono Transform");
-    window->resize(1100, 650);
+    // Use a conservative size that fits on 1366x768 and larger screens
+    // Account for window decorations (~37px title bar + borders)
+    window->resize(1024, 650);
+    
+    // Limit maximum size to prevent window from going off-screen
+    QScreen* primaryScreen = QGuiApplication::primaryScreen();
+    QRect availableGeometry = primaryScreen->availableGeometry();
+    int maxHeight = availableGeometry.height() - 100; // Leave 100px margin for panels
+    int maxWidth = availableGeometry.width() - 100;   // Leave 100px margin
+    window->setMaximumSize(maxWidth, maxHeight);
+    
+    // Ensure window is positioned on screen (handle multi-monitor setups)
+    QRect frameGeometry = window->frameGeometry();
+    int x = qMax(50, (availableGeometry.width() - frameGeometry.width()) / 2);
+    int y = qMax(50, (availableGeometry.height() - frameGeometry.height()) / 2);
+    window->move(x, y);  // Center on screen with padding
 
     // Single instance
     QString lockPath = QStandardPaths::writableLocation(QStandardPaths::TempLocation)
@@ -259,31 +278,38 @@ int main(int argc, char* argv[])
     QLabel *lbMultiple, *lbBins, *lbMin, *lbMax;
 
     auto* row1 = new QWidget;
+    row1->setMaximumHeight(40);  // Prevent row from expanding
     auto* row1Lay = new QHBoxLayout(row1);
     row1Lay->setContentsMargins(4, 2, 4, 2);
     row1Lay->setSpacing(12);
     row1Lay->addWidget(makeSlider("Multiple", slMultiple, 2, 120, multiple, " periods", lbMultiple));
-    row1Lay->addWidget(makeSlider("Bins", slBins, 32, 600, numBins, "", lbBins));
+    row1Lay->addWidget(makeSlider("Bins", slBins, 32, 1200, numBins, "", lbBins));
     row1Lay->addWidget(makeSlider("Freq min", slMin, 20, 2000, freqMin, " Hz", lbMin));
     row1Lay->addWidget(makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax));
-    mainLayout->addWidget(row1);
+    mainLayout->addWidget(row1, 0);  // 0 stretch factor - fixed size
 
     // ── Settings row 2: Visual tuning ──
-    QSlider *slGain, *slGamma, *slFloor, *slDisplaySeconds;
-    QLabel *lbGain, *lbGamma, *lbFloor, *lbDisplaySeconds;
+    QSlider *slGain, *slGamma, *slFloor, *slLeakiness, *slDisplaySeconds;
+    QLabel *lbGain, *lbGamma, *lbFloor, *lbLeakiness, *lbDisplaySeconds;
 
     auto* row2 = new QWidget;
+    row2->setMaximumHeight(40);  // Prevent row from expanding
     auto* row2Lay = new QHBoxLayout(row2);
     row2Lay->setContentsMargins(4, 2, 4, 2);
     row2Lay->setSpacing(12);
     row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, std::clamp(savedState.gainTenths, 1, 200), 10.0f, "x"));
     row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, std::clamp(savedState.gammaHundredths, 10, 200), 100.0f, ""));
     row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, std::clamp(savedState.floorHundredths, 0, 50), 100.0f, ""));
+    row2Lay->addWidget(makeFloatSlider("Leakiness", slLeakiness, lbLeakiness, 9900, 10000, std::clamp(savedState.leakinessHundredths, 9900, 10000), 10000.0f, ""));
+    // Fix initial label to show leakage percentage
+    double initialLeakage = (10000 - slLeakiness->value()) / 100.0;
+    lbLeakiness->setText(QString("Leak: %1%").arg(initialLeakage, 0, 'f', 2));
     row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, std::clamp(savedState.displayTenths, 10, 300), 10.0f, " s"));
-    mainLayout->addWidget(row2);
+    mainLayout->addWidget(row2, 0);  // 0 stretch factor - fixed size
 
     // ── Settings row 3: Input + execution/display mode ──
     auto* row3 = new QWidget;
+    row3->setMaximumHeight(60);  // Prevent row from expanding
     auto* row3Lay = new QHBoxLayout(row3);
     row3Lay->setContentsMargins(4, 2, 4, 2);
     row3Lay->setSpacing(12);
@@ -321,13 +347,14 @@ int main(int argc, char* argv[])
 
     row3Lay->addWidget(addLabeledField("Input device", devCombo), 1);
     row3Lay->addWidget(addLabeledField("Execution mode", modeCombo));
-    mainLayout->addWidget(row3);
+    mainLayout->addWidget(row3, 0);  // 0 stretch factor - fixed size
 
     // ── Spectrogram ──
     auto* spectrogram = new SpectrogramWidget(&transform);
     spectrogram->setGain(slGain->value() / 10.0f);
     spectrogram->setGamma(slGamma->value() / 100.0f);
     spectrogram->setFloor(slFloor->value() / 100.0f);
+    transform.setLeakiness(slLeakiness->value() / 10000.0);
     spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
     mainLayout->addWidget(spectrogram, 1);
 
@@ -344,6 +371,7 @@ int main(int argc, char* argv[])
         current.gainTenths = slGain->value();
         current.gammaHundredths = slGamma->value();
         current.floorHundredths = slFloor->value();
+        current.leakinessHundredths = slLeakiness->value();
         current.displayTenths = slDisplaySeconds->value();
         current.modeIndex = modeCombo->currentIndex();
         current.deviceId = devCombo->currentIndex() >= 0 ? devCombo->currentData().toInt() : currentDeviceId;
@@ -376,6 +404,13 @@ int main(int argc, char* argv[])
     QObject::connect(slFloor, &QSlider::valueChanged, [spectrogram](int v) {
         spectrogram->setFloor(v / 100.0f);
     });
+    QObject::connect(slLeakiness, &QSlider::valueChanged, [&transform, lbLeakiness, saveStateNow](int v) {
+        transform.setLeakiness(v / 10000.0);
+        // Update label to show percentage
+        double leakagePercent = (10000 - v) / 100.0;
+        lbLeakiness->setText(QString("Leak: %1%").arg(leakagePercent, 0, 'f', 2));
+        saveStateNow();
+    });
     QObject::connect(slDisplaySeconds, &QSlider::valueChanged, [spectrogram](int v) {
         spectrogram->setDisplayedTimeSeconds(v / 10.0);
     });
@@ -404,7 +439,8 @@ int main(int argc, char* argv[])
         statusBar->showMessage(message);
         saveStateNow();
     });
-    modeCombo->setCurrentIndex(modeCombo->currentIndex());
+    // Explicitly trigger the signal to set initial mode
+    emit modeCombo->currentIndexChanged(modeCombo->currentIndex());
 
     // ── Audio ──
     RtAudio adc;
