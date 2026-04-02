@@ -32,12 +32,13 @@ bool ApiServer::startListening(quint16 port)
     return true;
 }
 
-void ApiServer::updateCurrentSettings(int multiple, int bins, int freqMin, int freqMax)
+void ApiServer::updateCurrentSettings(int multiple, int bins, int freqMin, int freqMax, double baseAFreq)
 {
     curMultiple_ = multiple;
     curBins_ = bins;
     curFreqMin_ = freqMin;
     curFreqMax_ = freqMax;
+    curBaseAFreq_ = baseAFreq;
 }
 
 void ApiServer::incomingConnection(qintptr socketDescriptor)
@@ -102,6 +103,7 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             {"multiple", curMultiple_},
             {"freqMin", curFreqMin_},
             {"freqMax", curFreqMax_},
+            {"baseAFrequency", transform_->baseAFrequency()},
         });
 
     } else if (method == "GET" && path == "/api/screenshot") {
@@ -131,6 +133,7 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             {"freqMin", curFreqMin_},
             {"freqMax", curFreqMax_},
             {"sampleRate", transform_->sampleRate()},
+            {"baseAFrequency", transform_->baseAFrequency()},
         });
 
     } else if (method == "PUT" && path == "/api/profile") {
@@ -175,6 +178,7 @@ void ApiServer::handleRequest(QTcpSocket* socket)
             {"bins", curBins_},
             {"freqMin", curFreqMin_},
             {"freqMax", curFreqMax_},
+            {"baseAFrequency", transform_->baseAFrequency()},
             {"savedAt", QDateTime::currentDateTime().toString(Qt::ISODate)},
         };
         if (!file.open(QIODevice::WriteOnly)) {
@@ -227,11 +231,11 @@ void ApiServer::handleRequest(QTcpSocket* socket)
 
     } else if (method == "PUT" && path == "/api/device") {
         if (deviceSwitchCb_) {
-            unsigned int devId = static_cast<unsigned int>(body.value("id").toInt(-1));
-            if (devId == static_cast<unsigned int>(-1)) {
+            QString deviceKey = body.value("id").toString();
+            if (deviceKey.isEmpty()) {
                 sendError(socket, 400, "Missing 'id' field");
             } else {
-                QString result = deviceSwitchCb_(devId);
+                QString result = deviceSwitchCb_(deviceKey);
                 if (result.startsWith("Error")) {
                     sendError(socket, 500, result);
                 } else {

@@ -14,14 +14,16 @@ layout (local_size_x = THREADS_PER_WORKGROUP, local_size_y = 1, local_size_z = 1
 shared float sharedTr[THREADS_PER_WORKGROUP];
 shared float sharedTi[THREADS_PER_WORKGROUP];
 
+uniform float leakiness;
+
 void main() {
     uint frequency_ix = gl_WorkGroupID.x;
     uint thread_ix = gl_LocalInvocationID.x;
 
     float thisF = f[frequency_ix];
-    float thisP = 1.0 / thisF;
-    uint windowStart = uint(SIGNAL_LENGTH - multiple * thisP);
-    float dftlen = 1.0 / sqrt(multiple / thisF);
+    int thisWindowLen = windowLen[frequency_ix];
+    uint windowStart = uint(SIGNAL_LENGTH - thisWindowLen);
+    float dftlen = norm[frequency_ix];
 
     // Each thread accumulates over multiple samples
     float Tr = 0.0;
@@ -30,8 +32,10 @@ void main() {
     for (uint n = windowStart + thread_ix; n < SIGNAL_LENGTH; n += THREADS_PER_WORKGROUP) {
         uint read_ix = (n + offset[0]) % SIGNAL_LENGTH;
         float thisDatum = x[read_ix];
-        Tr += thisDatum * cos(2.0 * PI * thisF * float(n)) * dftlen;
-        Ti -= thisDatum * sin(2.0 * PI * thisF * float(n)) * dftlen;
+        float age = float(SIGNAL_LENGTH - 1u - n);
+        float weight = pow(leakiness, age);
+        Tr += thisDatum * cos(2.0 * PI * thisF * float(n)) * dftlen * weight;
+        Ti -= thisDatum * sin(2.0 * PI * thisF * float(n)) * dftlen * weight;
     }
 
     // Workgroup-local reduction via shared memory

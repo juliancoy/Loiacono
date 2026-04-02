@@ -7,20 +7,23 @@
 #include <QPaintEvent>
 #include <QResizeEvent>
 #include <QWheelEvent>
+#include <QMouseEvent>
+#include <QJsonObject>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
 class SpectrogramWidget::RasterCanvas : public QWidget {
 public:
-    explicit RasterCanvas(SpectrogramWidget* owner) : QWidget(owner), owner_(owner) {}
+    explicit RasterCanvas(SpectrogramWidget* owner) : QWidget(owner), owner_(owner)
+    {
+        setMouseTracking(true);
+    }
 
 protected:
     void paintEvent(QPaintEvent*) override
     {
         QPainter p(this);
-        // RED background to clearly see canvas bounds
-        p.fillRect(rect(), Qt::red);
         owner_->paintContent(p, size());
     }
 
@@ -33,6 +36,18 @@ protected:
     {
         owner_->handleWheelZoom(event->position().toPoint(), event->angleDelta().y(), size());
         event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override
+    {
+        owner_->updateHoverCursor(event->position().toPoint(), size());
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void leaveEvent(QEvent* event) override
+    {
+        unsetCursor();
+        QWidget::leaveEvent(event);
     }
 
 private:
@@ -51,10 +66,92 @@ SpectrogramWidget::SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent
 
     image_ = QImage(1, 1, QImage::Format_RGB32);
     image_.fill(Qt::black);
+    customToneCurve_ = {
+        QPointF(0.0, 0.0),
+        QPointF(0.25, 0.18),
+        QPointF(0.5, 0.5),
+        QPointF(0.75, 0.82),
+        QPointF(1.0, 1.0),
+    };
     lastFpsTime_ = QDateTime::currentMSecsSinceEpoch();
 
     connect(&timer_, &QTimer::timeout, this, &SpectrogramWidget::tick);
     timer_.start(0);
+}
+
+const char* SpectrogramWidget::displayNormalizationModeName(DisplayNormalizationMode mode)
+{
+    switch (mode) {
+    case DisplayNormalizationMode::SmoothedGlobalMax:
+        return "smoothed";
+    case DisplayNormalizationMode::PerFrameMax:
+        return "per-frame";
+    case DisplayNormalizationMode::PeakHoldDecay:
+        return "peak-hold";
+    case DisplayNormalizationMode::FixedReference:
+        return "fixed";
+    }
+    return "unknown";
+}
+
+const char* SpectrogramWidget::toneCurveModeName(ToneCurveMode mode)
+{
+    switch (mode) {
+    case ToneCurveMode::PowerGamma:
+        return "power";
+    case ToneCurveMode::Smoothstep:
+        return "smoothstep";
+    case ToneCurveMode::Sigmoid:
+        return "sigmoid";
+    case ToneCurveMode::CustomCurve:
+        return "custom";
+    }
+    return "unknown";
+}
+
+void SpectrogramWidget::setCustomToneCurve(const std::vector<QPointF>& controlPoints)
+{
+    if (controlPoints.size() < 2) return;
+
+    customToneCurve_ = controlPoints;
+    std::sort(customToneCurve_.begin(), customToneCurve_.end(), [](const QPointF& a, const QPointF& b) {
+        return a.x() < b.x();
+    });
+    customToneCurve_.front().setX(0.0);
+    customToneCurve_.front().setY(std::clamp(customToneCurve_.front().y(), 0.0, 1.0));
+    customToneCurve_.back().setX(1.0);
+    customToneCurve_.back().setY(std::clamp(customToneCurve_.back().y(), 0.0, 1.0));
+    for (auto& point : customToneCurve_) {
+        point.setX(std::clamp(point.x(), 0.0, 1.0));
+        point.setY(std::clamp(point.y(), 0.0, 1.0));
+    }
+    update();
+}
+
+QJsonArray SpectrogramWidget::customToneCurveJson() const
+{
+    QJsonArray arr;
+    for (const auto& point : customToneCurve_) {
+        arr.append(QJsonObject{
+            {"x", point.x()},
+            {"y", point.y()},
+        });
+    }
+    return arr;
+}
+
+void SpectrogramWidget::setCustomToneCurveJson(const QJsonArray& curve)
+{
+    std::vector<QPointF> points;
+    points.reserve(curve.size());
+    for (const auto& value : curve) {
+        if (!value.isObject()) continue;
+        QJsonObject obj = value.toObject();
+        points.emplace_back(obj.value("x").toDouble(), obj.value("y").toDouble());
+    }
+    if (points.size() >= 2) {
+        setCustomToneCurve(points);
+    }
 }
 
 void SpectrogramWidget::setHardwareAccelerationEnabled(bool enabled)
@@ -66,16 +163,25 @@ void SpectrogramWidget::setHardwareAccelerationEnabled(bool enabled)
 
 void SpectrogramWidget::setDisplayedTimeSeconds(double seconds)
 {
-    displaySeconds_ = std::max(0.5, seconds);
+    double clampedSeconds = std::max(0.5, seconds);
+    if (std::abs(displaySeconds_ - clampedSeconds) < 1e-9) return;
+    displaySeconds_ = clampedSeconds;
     lastColumnSampleCount_ = transform_->getStats().totalSamples;
     pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
     update();
+    emit displayedTimeChanged(displaySeconds_);
 }
 
 void SpectrogramWidget::resetHistory()
 {
     image_.fill(Qt::black);
+    maxAmplitude_ = 1.0f;
+    frameStats_.peakAmp = 0.0f;
+    frameStats_.maxAmp = maxAmplitude_;
+    pitchHistory_.clear();
+    smoothedPitchHz_ = 0.0;
+    frameStats_.pitch = {};
     lastColumnSampleCount_ = transform_->getStats().totalSamples;
     pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
@@ -96,6 +202,9 @@ void SpectrogramWidget::onCanvasResized()
         // vertical scaling may have changed (bins need to stretch to new height)
         image_ = QImage(spectRect.width(), spectRect.height(), QImage::Format_RGB32);
         image_.fill(Qt::black);
+        maxAmplitude_ = 1.0f;
+        frameStats_.peakAmp = 0.0f;
+        frameStats_.maxAmp = maxAmplitude_;
     }
     
     // Trigger repaint after image is resized
@@ -158,6 +267,18 @@ QRect SpectrogramWidget::histogramRect(const QSize& canvasSize) const
     return QRect(spectRect.right() + 2, spectRect.top(), HISTOGRAM_WIDTH - 2, spectRect.height());
 }
 
+QRect SpectrogramWidget::frequencyAxisRect(const QSize& canvasSize) const
+{
+    QRect spectRect = spectrogramRect(canvasSize);
+    return QRect(0, spectRect.top(), Y_AXIS_WIDTH - 5, spectRect.height());
+}
+
+QRect SpectrogramWidget::timeAxisRect(const QSize& canvasSize) const
+{
+    QRect spectRect = spectrogramRect(canvasSize);
+    return QRect(spectRect.left(), spectRect.bottom() + 1, spectRect.width(), AXIS_HEIGHT);
+}
+
 int SpectrogramWidget::binToY(int numBins, const QRect& rect, double binIndex) const
 {
     if (numBins <= 1) return rect.bottom();
@@ -167,8 +288,13 @@ int SpectrogramWidget::binToY(int numBins, const QRect& rect, double binIndex) c
 
 bool SpectrogramWidget::useDirectGpuPipeline() const
 {
-    return hardwareAccelerationEnabled_ &&
-           transform_->activeComputeMode() == LoiaconoRolling::ComputeMode::GpuCompute;
+    if (!hardwareAccelerationEnabled_) return false;
+    if (transform_->activeComputeMode() != LoiaconoRolling::ComputeMode::GpuCompute) return false;
+    if (displayNormalizationMode_ != DisplayNormalizationMode::SmoothedGlobalMax) return false;
+    if (toneCurveMode_ != ToneCurveMode::PowerGamma) return false;
+    auto windowMode = transform_->windowMode();
+    return windowMode == LoiaconoRolling::WindowMode::RectangularWindow
+        || windowMode == LoiaconoRolling::WindowMode::LeakyWindow;
 }
 
 void SpectrogramWidget::handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize)
@@ -176,9 +302,8 @@ void SpectrogramWidget::handleWheelZoom(const QPoint& position, int angleDeltaY,
     if (angleDeltaY == 0) return;
 
     QRect spectRect = spectrogramRect(canvasSize);
-    QRect histRect = histogramRect(canvasSize);
-    QRect xAxisRect(spectRect.left(), spectRect.bottom() + 1, spectRect.width(), AXIS_HEIGHT);
-    QRect yAxisHotRect(spectRect.left(), spectRect.top(), std::min(56, spectRect.width()), spectRect.height());
+    QRect xAxisRect = timeAxisRect(canvasSize);
+    QRect yAxisHotRect = frequencyAxisRect(canvasSize);
 
     double zoomFactor = angleDeltaY > 0 ? 0.85 : 1.18;
 
@@ -239,7 +364,18 @@ void SpectrogramWidget::handleWheelZoom(const QPoint& position, int angleDeltaY,
         return;
     }
 
-    Q_UNUSED(histRect);
+}
+
+void SpectrogramWidget::updateHoverCursor(const QPoint& position, const QSize& canvasSize)
+{
+    if (!canvas_) return;
+    if (frequencyAxisRect(canvasSize).contains(position)) {
+        canvas_->setCursor(Qt::SizeVerCursor);
+    } else if (timeAxisRect(canvasSize).contains(position)) {
+        canvas_->setCursor(Qt::SizeHorCursor);
+    } else {
+        canvas_->unsetCursor();
+    }
 }
 
 void SpectrogramWidget::tick()
@@ -259,8 +395,11 @@ void SpectrogramWidget::tick()
         historyRevision_++;
     }
 
-    // Always fetch spectrum for histogram display (even in GPU modes)
-    transform_->getSpectrum(spectrum_);
+    if (!useDirectGpuPipeline()) {
+        transform_->getSpectrum(spectrum_);
+    } else {
+        spectrum_.clear();
+    }
 
     float currentMax = frameStats_.peakAmp;
     int peakIdx = 0;
@@ -274,12 +413,31 @@ void SpectrogramWidget::tick()
             }
         }
     }
-    if (currentMax > maxAmplitude_) {
-        maxAmplitude_ = currentMax;
-    } else {
-        maxAmplitude_ = maxAmplitude_ * 0.997f + currentMax * 0.003f;
+    if (!useDirectGpuPipeline()) {
+        switch (displayNormalizationMode_) {
+        case DisplayNormalizationMode::SmoothedGlobalMax:
+            if (currentMax > maxAmplitude_) {
+                maxAmplitude_ = currentMax;
+            } else {
+                maxAmplitude_ = maxAmplitude_ * 0.997f + currentMax * 0.003f;
+            }
+            break;
+        case DisplayNormalizationMode::PerFrameMax:
+            maxAmplitude_ = currentMax;
+            break;
+        case DisplayNormalizationMode::PeakHoldDecay:
+            if (currentMax > maxAmplitude_) {
+                maxAmplitude_ = currentMax;
+            } else {
+                maxAmplitude_ *= 0.995f;
+            }
+            break;
+        case DisplayNormalizationMode::FixedReference:
+            maxAmplitude_ = fixedDisplayReference_;
+            break;
+        }
+        if (maxAmplitude_ < 0.01f) maxAmplitude_ = 0.01f;
     }
-    if (maxAmplitude_ < 0.01f) maxAmplitude_ = 0.01f;
 
     int w = image_.width();
     int h = image_.height();
@@ -334,6 +492,40 @@ void SpectrogramWidget::tick()
         frameStats_.peakHz = nb > 0 ? transform_->binFreqHz(peakIdx) : 0;
         frameStats_.peakAmp = currentMax;
         frameStats_.maxAmp = maxAmplitude_;
+        
+        // Detect root pitch using harmonic correlation
+        auto pitch = transform_->detectRootPitch(spectrum_, 50.0, 2000.0);
+        
+        // Apply smoothing for stable display
+        if (pitch.confidence > 0.3) {
+            pitchHistory_.push_back(pitch.freqHz);
+            if (pitchHistory_.size() > MAX_PITCH_HISTORY) {
+                pitchHistory_.erase(pitchHistory_.begin());
+            }
+            // Use median for robust smoothing
+            std::vector<double> sorted = pitchHistory_;
+            std::sort(sorted.begin(), sorted.end());
+            smoothedPitchHz_ = sorted[sorted.size() / 2];
+            
+            // Recalculate pitch result with smoothed frequency using configured base A
+            pitch.freqHz = smoothedPitchHz_;
+            double baseA = transform_->baseAFrequency();
+            double midiExact = 69.0 + 12.0 * std::log2(smoothedPitchHz_ / baseA);
+            int midiNote = static_cast<int>(std::round(midiExact));
+            midiNote = std::clamp(midiNote, 0, 127);
+            pitch.midiNote = midiNote;
+            pitch.cents = (midiExact - std::round(midiExact)) * 100.0;
+            
+            static const char* NOTE_NAMES[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+            int noteIndex = ((midiNote % 12) + 12) % 12;
+            int octave = (midiNote / 12) - 1;
+            static char noteBuf[8];
+            std::snprintf(noteBuf, sizeof(noteBuf), "%s%d", NOTE_NAMES[noteIndex], octave);
+            pitch.noteName = noteBuf;
+        }
+        frameStats_.pitch = pitch;
+    } else {
+        frameStats_.pitch = {};
     }
 
     if (auto* glCanvas = dynamic_cast<GlSpectrogramCanvas*>(canvas_)) {
@@ -345,14 +537,8 @@ void SpectrogramWidget::tick()
 
 SpectrogramWidget::RGB SpectrogramWidget::colormap(float amplitude) const
 {
-    float logMax = std::log(1.0f + maxAmplitude_ * gain_);
-    float t = logMax > 0 ? std::log(1.0f + amplitude * gain_) / logMax : 0;
-    t = std::clamp(t, 0.0f, 1.0f);
-
-    if (t < floor_) return {0, 0, 0};
-
-    t = (t - floor_) / (1.0f - floor_);
-    t = std::pow(t, gamma_);
+    float t = visualLevel(amplitude);
+    if (t <= 0.0f) return {0, 0, 0};
 
     uint8_t r, g, b;
     if (t < 0.15f) {
@@ -372,6 +558,54 @@ SpectrogramWidget::RGB SpectrogramWidget::colormap(float amplitude) const
         r = 255; g = static_cast<uint8_t>(255 * (1 - s * 0.6f)); b = static_cast<uint8_t>(s * 180);
     }
     return {r, g, b};
+}
+
+float SpectrogramWidget::visualLevel(float amplitude) const
+{
+    float logMax = std::log(1.0f + maxAmplitude_ * gain_);
+    float t = logMax > 0 ? std::log(1.0f + amplitude * gain_) / logMax : 0;
+    t = std::clamp(t, 0.0f, 1.0f);
+
+    if (t <= floor_) return 0.0f;
+    t = (t - floor_) / std::max(1e-6f, 1.0f - floor_);
+    return applyToneCurve(std::clamp(t, 0.0f, 1.0f));
+}
+
+float SpectrogramWidget::applyToneCurve(float t) const
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+    switch (toneCurveMode_) {
+    case ToneCurveMode::PowerGamma:
+        return std::pow(t, gamma_);
+    case ToneCurveMode::Smoothstep: {
+        float shaped = std::pow(t, std::max(0.05f, gamma_));
+        return shaped * shaped * (3.0f - 2.0f * shaped);
+    }
+    case ToneCurveMode::Sigmoid: {
+        float steepness = std::clamp(2.0f + (1.0f - gamma_) * 10.0f, 2.0f, 14.0f);
+        float x = (t - 0.5f) * steepness;
+        float lo = 1.0f / (1.0f + std::exp(steepness * 0.5f));
+        float hi = 1.0f / (1.0f + std::exp(-steepness * 0.5f));
+        float y = 1.0f / (1.0f + std::exp(-x));
+        return std::clamp((y - lo) / std::max(1e-6f, hi - lo), 0.0f, 1.0f);
+    }
+    case ToneCurveMode::CustomCurve:
+        break;
+    }
+
+    if (customToneCurve_.size() < 2) return t;
+    if (t <= customToneCurve_.front().x()) return std::clamp(static_cast<float>(customToneCurve_.front().y()), 0.0f, 1.0f);
+    if (t >= customToneCurve_.back().x()) return std::clamp(static_cast<float>(customToneCurve_.back().y()), 0.0f, 1.0f);
+    for (size_t i = 1; i < customToneCurve_.size(); ++i) {
+        const QPointF& a = customToneCurve_[i - 1];
+        const QPointF& b = customToneCurve_[i];
+        if (t > b.x()) continue;
+        double span = std::max(1e-9, b.x() - a.x());
+        double localT = (t - a.x()) / span;
+        double y = a.y() + (b.y() - a.y()) * localT;
+        return std::clamp(static_cast<float>(y), 0.0f, 1.0f);
+    }
+    return t;
 }
 
 void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
@@ -441,6 +675,7 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     lines << QString("FPS: %1").arg(frameStats_.fps, 0, 'f', 0);
     lines << QString("Displayed: %1 s").arg(displaySeconds_, 0, 'f', 1);
     lines << QString("Render: %1").arg(hardwareAccelerationEnabled_ ? "GPU" : "CPU");
+    lines << QString("Norm: %1").arg(displayNormalizationModeName(displayNormalizationMode_));
     lines << QString("CPU thr: %1").arg(transform_->cpuThreads());
     lines << QString("Compute: %1").arg(LoiaconoRolling::computeModeName(transform_->activeComputeMode()));
     lines << QString("Bins: %1 x%2").arg(stats.currentBins).arg(stats.currentMultiple);
@@ -448,6 +683,30 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     lines << QString("%1 kS/s").arg(stats.samplesPerSecond / 1000.0, 0, 'f', 1);
     if (!directGpu) {
         lines.insert(1, QString("Peak: %1 Hz").arg(frameStats_.peakHz, 0, 'f', 0));
+    }
+    
+    // Add pitch detection info with sharp/flat indicators
+    if (!directGpu && frameStats_.pitch.confidence > 0.2) {
+        QString directionStr;
+        auto direction = LoiaconoRolling::getPitchDirection(frameStats_.pitch.cents, 5.0);
+        if (direction == LoiaconoRolling::PitchDirection::Flat) {
+            directionStr = "\u25BC";  // Down triangle (flat)
+        } else if (direction == LoiaconoRolling::PitchDirection::Sharp) {
+            directionStr = "\u25B2";  // Up triangle (sharp)
+        } else {
+            directionStr = "\u25CF";  // Circle (in tune)
+        }
+        
+        QString centsStr;
+        if (std::abs(frameStats_.pitch.cents) < 5) {
+            centsStr = "=";  // In tune
+        } else {
+            centsStr = QString("%1%2").arg(frameStats_.pitch.cents > 0 ? "+" : "")
+                                       .arg(static_cast<int>(std::round(frameStats_.pitch.cents)));
+        }
+        lines << QString("Pitch: %1 %2 %3").arg(frameStats_.pitch.noteName).arg(directionStr).arg(centsStr);
+        lines << QString("  %1 Hz (%2%)").arg(frameStats_.pitch.freqHz, 0, 'f', 1)
+                                          .arg(frameStats_.pitch.confidence * 100, 0, 'f', 0);
     }
 
     int lineH = 13;
@@ -484,8 +743,9 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
         smallFont.setPixelSize(10);
         p.setFont(smallFont);
         p.setPen(QColor(100, 100, 130));
-        p.drawText(barX, barY - 2, QString("gain:%1 gamma:%2 floor:%3")
-                   .arg(gain_, 0, 'f', 1).arg(gamma_, 0, 'f', 2).arg(floor_, 0, 'f', 2));
+        p.drawText(barX, barY - 2, QString("gain:%1 gamma:%2 floor:%3 curve:%4")
+                   .arg(gain_, 0, 'f', 1).arg(gamma_, 0, 'f', 2).arg(floor_, 0, 'f', 2)
+                   .arg(toneCurveModeName(toneCurveMode_)));
     }
 
     int axisY = spectRect.bottom() + 1;
@@ -526,10 +786,8 @@ void SpectrogramWidget::paintContent(QPainter& p, const QSize& canvasSize)
     p.fillRect(histRect.adjusted(-1, 0, 1, 0), QColor(12, 12, 20));
 
     if (!spectrum_.empty() && maxAmplitude_ > 0) {
-        float logMax = std::log(1.0f + maxAmplitude_ * gain_);
         for (int fi = 0; fi < nb; fi++) {
-            float t = logMax > 0 ? std::log(1.0f + spectrum_[fi] * gain_) / logMax : 0;
-            t = std::clamp(t, 0.0f, 1.0f);
+            float t = visualLevel(spectrum_[fi]);
             int barW = static_cast<int>(t * histRect.width());
             if (barW < 1) continue;
 

@@ -3,10 +3,10 @@
 #include <memory>
 #include <vector>
 
-class LoiaconoGpuCompute {
+class LoiaconoVulkanCompute {
 public:
-    LoiaconoGpuCompute();
-    ~LoiaconoGpuCompute();
+    LoiaconoVulkanCompute();
+    ~LoiaconoVulkanCompute();
 
     bool available() const;
     bool configure(int signalLength,

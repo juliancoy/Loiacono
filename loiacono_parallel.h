@@ -18,6 +18,7 @@ void processBinsParallel(
     const std::vector<int>& windowLens,
     std::vector<double>& tr,
     std::vector<double>& ti,
+    const std::vector<float>& overwrittenSamples,
     double leakiness);
 
 }

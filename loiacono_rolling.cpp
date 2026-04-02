@@ -22,15 +22,29 @@
 #include "loiacono_gpu_compute.h"
 #include "loiacono_parallel.h"
 #include <algorithm>
+#include <array>
+#include <future>
 #include <QDebug>
 
 static constexpr double TWO_PI = 2.0 * M_PI;
 
 LoiaconoRolling::~LoiaconoRolling() = default;
 
+void LoiaconoRolling::setComputeMode(ComputeMode mode)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    computeMode_ = mode;
+    if ((computeMode_ == ComputeMode::GpuCompute || computeMode_ == ComputeMode::VulkanCompute) && numBins_ > 0) {
+        ensureGpuBackendsConfiguredLocked();
+    }
+}
+
 LoiaconoRolling::ComputeMode LoiaconoRolling::activeComputeMode() const
 {
     if (computeMode_ == ComputeMode::GpuCompute && !gpuComputeAvailable()) {
+        return ComputeMode::MultiThread;
+    }
+    if (computeMode_ == ComputeMode::VulkanCompute && !vulkanComputeAvailable()) {
         return ComputeMode::MultiThread;
     }
     return computeMode_;
@@ -45,14 +59,231 @@ const char* LoiaconoRolling::computeModeName(ComputeMode mode)
         return "multi-thread";
     case ComputeMode::GpuCompute:
         return "gpu-compute";
+    case ComputeMode::VulkanCompute:
+        return "vulkan-compute";
+    }
+    return "unknown";
+}
+
+const char* LoiaconoRolling::windowModeName(WindowMode mode)
+{
+    switch (mode) {
+    case WindowMode::RectangularWindow:
+        return "rectangular";
+    case WindowMode::HannWindow:
+        return "hann";
+    case WindowMode::HammingWindow:
+        return "hamming";
+    case WindowMode::BlackmanWindow:
+        return "blackman";
+    case WindowMode::BlackmanHarrisWindow:
+        return "blackman-harris";
+    case WindowMode::LeakyWindow:
+        return "leaky";
+    }
+    return "unknown";
+}
+
+const char* LoiaconoRolling::normalizationModeName(NormalizationMode mode)
+{
+    switch (mode) {
+    case NormalizationMode::RawSum:
+        return "raw";
+    case NormalizationMode::CoherentAmplitude:
+        return "coherent";
+    case NormalizationMode::Energy:
+        return "energy";
     }
     return "unknown";
 }
 
 bool LoiaconoRolling::gpuComputeAvailable() const
 {
-    return (gpuRollingCompute_ && gpuRollingCompute_->available()) ||
-           (gpuCompute_ && gpuCompute_->available());
+    return gpuCompute_ && gpuCompute_->available();
+}
+
+bool LoiaconoRolling::vulkanComputeAvailable() const
+{
+    return vulkanCompute_ && vulkanCompute_->available();
+}
+
+double LoiaconoRolling::normalizationScaleForWindow(int wlen) const
+{
+    const int safeLen = std::max(1, wlen);
+    double weightSum = 0.0;
+    double weightEnergy = 0.0;
+    for (int i = 0; i < safeLen; ++i) {
+        double w = windowWeightAt(i, safeLen);
+        weightSum += w;
+        weightEnergy += w * w;
+    }
+    switch (normalizationMode_) {
+    case NormalizationMode::RawSum:
+        return 1.0;
+    case NormalizationMode::CoherentAmplitude:
+        return weightSum > 0.0 ? 1.0 / weightSum : 1.0;
+    case NormalizationMode::Energy:
+        return weightEnergy > 0.0 ? 1.0 / std::sqrt(weightEnergy) : 1.0;
+    }
+    return 1.0;
+}
+
+double LoiaconoRolling::effectiveLeakiness() const
+{
+    return windowMode_ == WindowMode::LeakyWindow ? leakiness_ : 1.0;
+}
+
+bool LoiaconoRolling::usesRollingState() const
+{
+    return windowMode_ == WindowMode::RectangularWindow || windowMode_ == WindowMode::LeakyWindow;
+}
+
+double LoiaconoRolling::windowWeightAt(int index, int wlen) const
+{
+    if (wlen <= 1) return 1.0;
+    const double phase = TWO_PI * static_cast<double>(index) / static_cast<double>(wlen - 1);
+    switch (windowMode_) {
+    case WindowMode::RectangularWindow:
+    case WindowMode::LeakyWindow:
+        return 1.0;
+    case WindowMode::HannWindow:
+        return 0.5 - 0.5 * std::cos(phase);
+    case WindowMode::HammingWindow:
+        return 0.54 - 0.46 * std::cos(phase);
+    case WindowMode::BlackmanWindow:
+        return 0.42 - 0.5 * std::cos(phase) + 0.08 * std::cos(2.0 * phase);
+    case WindowMode::BlackmanHarrisWindow:
+        return 0.35875 - 0.48829 * std::cos(phase) + 0.14128 * std::cos(2.0 * phase)
+            - 0.01168 * std::cos(3.0 * phase);
+    }
+    return 1.0;
+}
+
+const std::vector<float>& LoiaconoRolling::cachedWindowWeights(int wlen) const
+{
+    auto it = cachedWindowWeights_.find(wlen);
+    if (it != cachedWindowWeights_.end()) {
+        return it->second;
+    }
+
+    std::vector<float> weights(static_cast<size_t>(std::max(1, wlen)), 1.0f);
+    if (wlen > 1) {
+        for (int i = 0; i < wlen; ++i) {
+            weights[static_cast<size_t>(i)] = static_cast<float>(windowWeightAt(i, wlen));
+        }
+    }
+    auto [inserted, ok] = cachedWindowWeights_.emplace(wlen, std::move(weights));
+    return inserted->second;
+}
+
+bool LoiaconoRolling::ensureGpuBackendsConfiguredLocked()
+{
+    if (!gpuCompute_) {
+        gpuCompute_ = std::make_unique<LoiaconoGpuCompute>();
+    }
+    if (!gpuRollingCompute_) {
+        gpuRollingCompute_ = std::make_unique<LoiaconoGpuRollingCompute>();
+    }
+    if (!vulkanCompute_) {
+        vulkanCompute_ = std::make_unique<LoiaconoVulkanCompute>();
+    }
+
+    bool rollingOk = gpuRollingCompute_->configure(RING_SIZE, 2048, numBins_, freqs_, norms_, windowLens_);
+    bool computeOk = gpuCompute_->configure(RING_SIZE, numBins_, freqs_, norms_, windowLens_);
+    bool vulkanOk = vulkanCompute_->configure(RING_SIZE, numBins_, freqs_, norms_, windowLens_);
+    return rollingOk || computeOk || vulkanOk;
+}
+
+void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out) const
+{
+    SpectrumSnapshot snapshot;
+    snapshot.ring = ring_;
+    snapshot.freqs = freqs_;
+    snapshot.norms = norms_;
+    snapshot.windowLens = windowLens_;
+    snapshot.ringHead = ringHead_;
+    snapshot.sampleCount = sampleCount_;
+    snapshot.windowMode = windowMode_;
+    snapshot.leakiness = effectiveLeakiness();
+    computeSpectrumFromSnapshot(snapshot, out);
+}
+
+void LoiaconoRolling::computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+{
+    const int numBins = static_cast<int>(snapshot.freqs.size());
+    out.resize(numBins);
+    std::unordered_map<int, const std::vector<float>*> windowCache;
+    if (snapshot.windowMode != WindowMode::RectangularWindow && snapshot.windowMode != WindowMode::LeakyWindow) {
+        for (int fi = 0; fi < numBins; ++fi) {
+            const int wlen = snapshot.windowLens[fi];
+            const uint64_t startSample = snapshot.sampleCount > static_cast<uint64_t>(wlen)
+                ? (snapshot.sampleCount - static_cast<uint64_t>(wlen))
+                : 0;
+            const int validSamples = static_cast<int>(snapshot.sampleCount - startSample);
+            if (windowCache.find(validSamples) == windowCache.end()) {
+                windowCache.emplace(validSamples, &cachedWindowWeights(validSamples));
+            }
+        }
+    }
+
+    auto processRange = [&](int begin, int end) {
+        for (int fi = begin; fi < end; ++fi) {
+            double tr = 0.0;
+            double ti = 0.0;
+            const double f = snapshot.freqs[fi];
+            const double norm = snapshot.norms[fi];
+            const int wlen = snapshot.windowLens[fi];
+            const uint64_t startSample = snapshot.sampleCount > static_cast<uint64_t>(wlen)
+                ? (snapshot.sampleCount - static_cast<uint64_t>(wlen))
+                : 0;
+            const int validSamples = static_cast<int>(snapshot.sampleCount - startSample);
+            const int readOffset = (snapshot.ringHead - validSamples + RING_SIZE) % RING_SIZE;
+            const std::vector<float>* weights = nullptr;
+            if (snapshot.windowMode != WindowMode::RectangularWindow && snapshot.windowMode != WindowMode::LeakyWindow) {
+                weights = windowCache.at(validSamples);
+            }
+
+            const double delta = TWO_PI * f;
+            const double cosDelta = std::cos(delta);
+            const double sinDelta = std::sin(delta);
+            double cosAngle = std::cos(delta * static_cast<double>(startSample));
+            double sinAngle = std::sin(delta * static_cast<double>(startSample));
+
+            for (int k = 0; k < validSamples; ++k) {
+                const int ringIdx = (readOffset + k) % RING_SIZE;
+                const float sample = snapshot.ring[ringIdx];
+                const double weight = weights ? (*weights)[static_cast<size_t>(k)] : 1.0;
+                tr *= snapshot.leakiness;
+                ti *= snapshot.leakiness;
+                tr += sample * cosAngle * norm * weight;
+                ti -= sample * sinAngle * norm * weight;
+
+                const double nextCos = cosAngle * cosDelta - sinAngle * sinDelta;
+                sinAngle = sinAngle * cosDelta + cosAngle * sinDelta;
+                cosAngle = nextCos;
+            }
+            out[fi] = static_cast<float>(std::sqrt(tr * tr + ti * ti));
+        }
+    };
+
+    unsigned int threads = std::min<unsigned int>(workerCount_, std::max(1, numBins));
+    if (threads <= 1 || numBins < 64) {
+        processRange(0, numBins);
+        return;
+    }
+
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(threads);
+    int binsPerThread = (numBins + static_cast<int>(threads) - 1) / static_cast<int>(threads);
+    for (unsigned int t = 0; t < threads; ++t) {
+        int begin = static_cast<int>(t) * binsPerThread;
+        int end = std::min(numBins, begin + binsPerThread);
+        if (begin >= end) break;
+        jobs.push_back(std::async(std::launch::async, processRange, begin, end));
+    }
+    for (auto& job : jobs) {
+        job.get();
+    }
 }
 
 void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMax,
@@ -70,21 +301,28 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
 
     double logMin = std::log(freqMin);
     double logMax = std::log(freqMax);
-    double logStep = (logMax - logMin) / numBins;
+    double logStep = numBins > 1 ? (logMax - logMin) / (numBins - 1) : 0.0;
 
     // Configure bins with Goertzel scaling:
     // - Window length scales inversely with frequency (constant Q)
     // - Normalization scales as 1/sqrt(window_length) for amplitude consistency
+    // - Window length is limited to RING_SIZE to prevent ring buffer overflow
     for (int i = 0; i < numBins; i++) {
         double fHz = std::exp(logMin + i * logStep);
         double fNorm = fHz / sampleRate;
         freqs_[i] = fNorm;
 
-        int wlen = static_cast<int>(multiple / fNorm);
+        // Limit window to ring buffer size, but also limit multiple for low frequencies
+        // to ensure the intended window fits in the ring buffer
+        int maxMultipleForFreq = static_cast<int>(RING_SIZE * fNorm);
+        int effectiveMultiple = std::min(multiple, maxMultipleForFreq);
+        effectiveMultiple = std::max(effectiveMultiple, 2);  // At least 2 periods
+        
+        int wlen = static_cast<int>(effectiveMultiple / fNorm);
         wlen = std::min(wlen, RING_SIZE);
         windowLens_[i] = wlen;
         // Goertzel amplitude scaling: 1/sqrt(N) to normalize for window size
-        norms_[i] = 1.0 / std::sqrt(static_cast<double>(wlen));
+        norms_[i] = normalizationScaleForWindow(wlen);
     }
 
     Tr_.assign(numBins, 0.0);
@@ -94,19 +332,17 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     sampleCount_ = 0;
     pendingGpuChunks_.clear();
     pendingGpuChunksOverflowed_ = false;
+    cachedWindowWeights_.clear();
 
-    if (!gpuCompute_) {
-        gpuCompute_ = std::make_unique<LoiaconoGpuCompute>();
+    if (computeMode_ == ComputeMode::GpuCompute || computeMode_ == ComputeMode::VulkanCompute) {
+        ensureGpuBackendsConfiguredLocked();
     }
-    if (!gpuRollingCompute_) {
-        gpuRollingCompute_ = std::make_unique<LoiaconoGpuRollingCompute>();
-    }
-    gpuRollingCompute_->configure(RING_SIZE, 2048, numBins_, freqs_, norms_, windowLens_);
-    gpuCompute_->configure(RING_SIZE, numBins_, multiple_, freqs_);
 }
 
 void LoiaconoRolling::processSample(float sample)
 {
+    const double leak = effectiveLeakiness();
+    float overwrittenSample = ring_[ringHead_];
     ring_[ringHead_] = sample;
 
     for (int fi = 0; fi < numBins_; fi++) {
@@ -115,8 +351,8 @@ void LoiaconoRolling::processSample(float sample)
         int wlen = windowLens_[fi];
 
         // Apply leakiness factor per sample (correct for single-sample processing)
-        Tr_[fi] *= leakiness_;
-        Ti_[fi] *= leakiness_;
+        Tr_[fi] *= leak;
+        Ti_[fi] *= leak;
 
         // Rolling Goertzel recurrence:
         // The Goertzel algorithm computes DFT coefficients efficiently using a
@@ -137,7 +373,7 @@ void LoiaconoRolling::processSample(float sample)
         // Rolling window: subtract the sample that just left the window
         if (sampleCount_ >= static_cast<uint64_t>(wlen)) {
             int oldIdx = (ringHead_ - wlen + RING_SIZE) % RING_SIZE;
-            float oldSample = ring_[oldIdx];
+            float oldSample = (oldIdx == ringHead_) ? overwrittenSample : ring_[oldIdx];
             double oldAngle = TWO_PI * f * static_cast<double>(sampleCount_ - wlen);
             Tr_[fi] -= oldSample * std::cos(oldAngle) * norm;
             Ti_[fi] += oldSample * std::sin(oldAngle) * norm;
@@ -154,8 +390,9 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        const double leak = effectiveLeakiness();
         ComputeMode mode = activeComputeMode();
-        if (mode == ComputeMode::GpuCompute) {
+        if (mode == ComputeMode::GpuCompute || mode == ComputeMode::VulkanCompute || !usesRollingState()) {
             const int startRingHead = ringHead_;
             const uint64_t startSampleCount = sampleCount_;
             for (int i = 0; i < count; i++) {
@@ -167,10 +404,12 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
             delta.newSamples.assign(samples, samples + count);
             delta.ringHeadStart = startRingHead;
             delta.startSampleCount = startSampleCount;
-            pendingGpuChunks_.push_back(std::move(delta));
-            while (pendingGpuChunks_.size() > MAX_PENDING_GPU_CHUNKS) {
-                pendingGpuChunks_.pop_front();
-                pendingGpuChunksOverflowed_ = true;
+            if (mode == ComputeMode::GpuCompute || mode == ComputeMode::VulkanCompute) {
+                pendingGpuChunks_.push_back(std::move(delta));
+                while (pendingGpuChunks_.size() > MAX_PENDING_GPU_CHUNKS) {
+                    pendingGpuChunks_.pop_front();
+                    pendingGpuChunksOverflowed_ = true;
+                }
             }
             // GPU compute will be processed in the GUI thread via takePendingGpuChunks()
             // Don't call gpuRollingCompute_->processChunk() here as it uses OpenGL
@@ -183,6 +422,11 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
             // Multi-thread mode
             const int startRingHead = ringHead_;
             const uint64_t startSampleCount = sampleCount_;
+            std::vector<float> overwrittenSamples(count);
+
+            for (int i = 0; i < count; i++) {
+                overwrittenSamples[i] = ring_[(startRingHead + i) % RING_SIZE];
+            }
 
             for (int i = 0; i < count; i++) {
                 ring_[(startRingHead + i) % RING_SIZE] = samples[i];
@@ -203,7 +447,8 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                 windowLens_,
                 Tr_,
                 Ti_,
-                leakiness_);
+                overwrittenSamples,
+                leak);
         }
     }
 
@@ -216,44 +461,69 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 
 void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    if (activeComputeMode() == ComputeMode::GpuCompute) {
-        // In CPU display mode, we need to process pending chunks before reading spectrum
-        // because the GPU paint path won't be called
-        if (!pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
-            // Take chunks and process them (need to cast away const for modification)
-            auto& chunks = const_cast<std::deque<GpuChunkDelta>&>(pendingGpuChunks_);
-            auto& overflowed = const_cast<bool&>(pendingGpuChunksOverflowed_);
-            
-            while (!chunks.empty()) {
-                const auto& delta = chunks.front();
-                gpuRollingCompute_->processChunk(delta.newSamples.data(), 
-                                                 static_cast<int>(delta.newSamples.size()),
-                                                 delta.startSampleCount,
-                                                 delta.ringHeadStart,
-                                                 leakiness_);
-                chunks.pop_front();
+    SpectrumSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const float leak = static_cast<float>(effectiveLeakiness());
+        
+        if ((activeComputeMode() == ComputeMode::GpuCompute || activeComputeMode() == ComputeMode::VulkanCompute) && usesRollingState()) {
+            if (activeComputeMode() == ComputeMode::VulkanCompute) {
+                if (vulkanCompute_ && vulkanCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), leak, out)) {
+                    return;
+                }
+            } else {
+                if (gpuCompute_ && gpuCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), leak, out)) {
+                    return;
+                }
             }
-            overflowed = false;
+
+            if (!pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
+                auto& chunks = const_cast<std::deque<GpuChunkDelta>&>(pendingGpuChunks_);
+                auto& overflowed = const_cast<bool&>(pendingGpuChunksOverflowed_);
+
+                bool rollingOk = true;
+                while (!chunks.empty()) {
+                    const auto& delta = chunks.front();
+                    rollingOk = gpuRollingCompute_->processChunk(delta.newSamples.data(),
+                                                                 static_cast<int>(delta.newSamples.size()),
+                                                                 delta.startSampleCount,
+                                                                 delta.ringHeadStart,
+                                                                 leak);
+                    chunks.pop_front();
+                    if (!rollingOk) break;
+                }
+                overflowed = false;
+
+                if (rollingOk && gpuRollingCompute_->spectrum(out)) {
+                    return;
+                }
+            }
         }
         
-        if (gpuRollingCompute_ && gpuRollingCompute_->available()) {
-            if (gpuRollingCompute_->spectrum(out)) {
-                return;
+        if (computeMode_ == ComputeMode::GpuCompute || computeMode_ == ComputeMode::VulkanCompute || !usesRollingState()) {
+            snapshot.ring = ring_;
+            snapshot.freqs = freqs_;
+            snapshot.norms = norms_;
+            snapshot.windowLens = windowLens_;
+            snapshot.ringHead = ringHead_;
+            snapshot.sampleCount = sampleCount_;
+            snapshot.computeMode = computeMode_;
+            snapshot.windowMode = windowMode_;
+            snapshot.leakiness = effectiveLeakiness();
+            if (usesRollingState()) {
+                snapshot.tr = Tr_;
+                snapshot.ti = Ti_;
             }
-        }
-        
-        if (gpuCompute_ && gpuCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), out)) {
+        } else {
+            out.resize(numBins_);
+            for (int i = 0; i < numBins_; i++) {
+                out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));
+            }
             return;
         }
     }
-    
-    // CPU fallback (used by SingleThread and MultiThread modes)
-    out.resize(numBins_);
-    for (int i = 0; i < numBins_; i++) {
-        out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));
-    }
+
+    computeSpectrumFromSnapshot(snapshot, out);
 }
 
 LoiaconoRolling::Stats LoiaconoRolling::getStats() const
@@ -305,4 +575,175 @@ LoiaconoRolling::GpuChunkBatch LoiaconoRolling::takePendingGpuChunks()
     }
     pendingGpuChunksOverflowed_ = false;
     return batch;
+}
+
+// Convert bin index to frequency (Hz)
+double LoiaconoRolling::binToFreqHz(double binIndex) const
+{
+    if (numBins_ <= 1) return binFreqHz(0);
+    double t = std::clamp(binIndex / (numBins_ - 1.0), 0.0, 1.0);
+    double logMin = std::log(freqs_[0] * sampleRate_);
+    double logMax = std::log(freqs_[numBins_ - 1] * sampleRate_);
+    return std::exp(logMin + t * (logMax - logMin));
+}
+
+// Convert frequency (Hz) to bin index (can be fractional)
+double LoiaconoRolling::freqToBin(double freqHz) const
+{
+    if (numBins_ <= 1) return 0;
+    double fMin = freqs_[0] * sampleRate_;
+    double fMax = freqs_[numBins_ - 1] * sampleRate_;
+    if (freqHz <= fMin) return 0;
+    if (freqHz >= fMax) return numBins_ - 1;
+    double logMin = std::log(fMin);
+    double logMax = std::log(fMax);
+    double logFreq = std::log(freqHz);
+    double t = (logFreq - logMin) / (logMax - logMin);
+    return t * (numBins_ - 1.0);
+}
+
+// Get interpolated spectrum value at fractional bin index
+float LoiaconoRolling::interpolatedSpectrum(const std::vector<float>& spectrum, double binIndex) const
+{
+    if (spectrum.empty()) return 0;
+    int n = static_cast<int>(spectrum.size());
+    if (binIndex <= 0) return spectrum[0];
+    if (binIndex >= n - 1) return spectrum[n - 1];
+    
+    int i0 = static_cast<int>(std::floor(binIndex));
+    int i1 = std::min(i0 + 1, n - 1);
+    double frac = binIndex - i0;
+    
+    return static_cast<float>(spectrum[i0] * (1.0 - frac) + spectrum[i1] * frac);
+}
+
+// Note names for A440 12TET
+static const char* NOTE_NAMES[] = {
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
+};
+
+// Get pitch direction based on cents deviation
+LoiaconoRolling::PitchDirection LoiaconoRolling::getPitchDirection(double cents, double threshold)
+{
+    if (cents < -threshold) return PitchDirection::Flat;
+    if (cents > threshold) return PitchDirection::Sharp;
+    return PitchDirection::InTune;
+}
+
+// Detect root pitch using harmonic correlation
+// Uses a simplified harmonic product spectrum approach adapted for log-spaced bins
+LoiaconoRolling::PitchResult LoiaconoRolling::detectRootPitch(
+    const std::vector<float>& spectrum, double minFreq, double maxFreq, double baseAFreq) const
+{
+    double referenceA = baseAFreq > 0 ? baseAFreq : baseAFreq_;  // Use provided or default
+    PitchResult result;
+    if (spectrum.empty() || numBins_ < 2) return result;
+    
+    // Find valid frequency range in bin indices
+    double binMin = std::max(0.0, freqToBin(minFreq));
+    double binMax = std::min(static_cast<double>(numBins_ - 1), freqToBin(maxFreq));
+    if (binMin >= binMax) return result;
+    
+    // Find the peak bin for normalization
+    float maxAmp = 0;
+    for (float v : spectrum) maxAmp = std::max(maxAmp, v);
+    if (maxAmp < 1e-10f) return result;
+    
+    // Search for fundamental using harmonic correlation
+    // For each candidate fundamental, compute correlation with harmonics
+    double bestBin = 0;
+    double bestScore = 0;
+    
+    const int numHarmonics = 6;  // Check up to 6th harmonic
+    const double harmonicWeights[] = {1.0, 0.8, 0.6, 0.5, 0.4, 0.35};  // Fundamentals weighted more
+    
+    // Step through candidate fundamentals in log space
+    int numSteps = std::max(10, numBins_ / 4);  // Reasonable resolution
+    for (int step = 0; step < numSteps; step++) {
+        double t = step / static_cast<double>(numSteps - 1);
+        double candidateBin = binMin + t * (binMax - binMin);
+        double candidateFreq = binToFreqHz(candidateBin);
+        
+        // Compute harmonic correlation score
+        double score = 0;
+        double weightSum = 0;
+        
+        for (int h = 0; h < numHarmonics; h++) {
+            double harmonicFreq = candidateFreq * (h + 1);
+            if (harmonicFreq > freqs_[numBins_ - 1] * sampleRate_ * 0.95) break;
+            
+            double harmonicBin = freqToBin(harmonicFreq);
+            float amp = interpolatedSpectrum(spectrum, harmonicBin) / maxAmp;  // Normalized
+            
+            // Weight by expected harmonic amplitude roll-off (higher harmonics usually weaker)
+            score += amp * harmonicWeights[h];
+            weightSum += harmonicWeights[h];
+        }
+        
+        if (weightSum > 0) {
+            score /= weightSum;  // Normalize by weights
+            // Penalize very low frequencies (often noise)
+            if (candidateFreq < 80) score *= 0.8;
+        }
+        
+        if (score > bestScore) {
+            bestScore = score;
+            bestBin = candidateBin;
+        }
+    }
+    
+    if (bestScore < 0.05) return result;  // Too quiet/noisy
+    
+    // Refine using quadratic interpolation around the peak
+    double refinedBin = bestBin;
+    int iBest = static_cast<int>(std::round(bestBin));
+    if (iBest > 0 && iBest < numBins_ - 1) {
+        double y0 = 0, y1 = bestScore, y2 = 0;
+        // Recompute neighbor scores for interpolation
+        for (int offset : {-1, 1}) {
+            double neighborBin = bestBin + offset * 0.5;
+            double neighborFreq = binToFreqHz(neighborBin);
+            double score = 0;
+            for (int h = 0; h < numHarmonics; h++) {
+                double harmonicFreq = neighborFreq * (h + 1);
+                if (harmonicFreq > freqs_[numBins_ - 1] * sampleRate_ * 0.95) break;
+                double harmonicBin = freqToBin(harmonicFreq);
+                score += interpolatedSpectrum(spectrum, harmonicBin) / maxAmp * harmonicWeights[h];
+            }
+            if (offset == -1) y0 = score / numHarmonics;
+            else y2 = score / numHarmonics;
+        }
+        // Parabolic interpolation: peak at x = i + (y0 - y2) / (2*(y0 - 2*y1 + y2))
+        double denom = 2.0 * (y0 - 2.0 * y1 + y2);
+        if (std::abs(denom) > 1e-10) {
+            double shift = (y0 - y2) / denom;
+            refinedBin = bestBin + std::clamp(shift, -0.5, 0.5);
+        }
+    }
+    
+    double detectedFreq = binToFreqHz(refinedBin);
+    
+    // Convert to MIDI note number (A4 = referenceA Hz = MIDI 69)
+    // MIDI note = 69 + 12 * log2(freq / referenceA)
+    double midiExact = 69.0 + 12.0 * std::log2(detectedFreq / referenceA);
+    int midiNote = static_cast<int>(std::round(midiExact));
+    midiNote = std::clamp(midiNote, 0, 127);
+    
+    // Calculate cents deviation
+    double cents = (midiExact - std::round(midiExact)) * 100.0;
+    
+    // Get note name
+    int noteIndex = ((midiNote % 12) + 12) % 12;  // Handle negative
+    int octave = (midiNote / 12) - 1;
+    static char noteNameBuf[16];
+    std::snprintf(noteNameBuf, sizeof(noteNameBuf), "%s%d", NOTE_NAMES[noteIndex], octave);
+    
+    // Store result
+    result.freqHz = detectedFreq;
+    result.confidence = std::min(1.0, bestScore);
+    result.midiNote = midiNote;
+    result.cents = cents;
+    result.noteName = noteNameBuf;
+    
+    return result;
 }

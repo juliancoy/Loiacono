@@ -31,7 +31,7 @@ class SpectrogramWidget;
 //   GET  /api/stream                 - MJPEG video stream (use in <img> tag)
 //   GET  /api/runtime                - runtime stats (fps, cpu load, samples/sec)
 //   GET  /api/devices                - list audio input devices
-//   PUT  /api/device                 - switch audio input device {"id": 131}
+//   PUT  /api/device                 - switch audio input device {"id": "2:131"}
 //   GET  /api/debug/sizes            - hierarchical widget size debug info
 
 class ApiServer : public QTcpServer {
@@ -48,12 +48,12 @@ public:
 
     // Audio device callbacks
     using DeviceListCallback = std::function<QJsonArray()>;
-    using DeviceSwitchCallback = std::function<QString(unsigned int deviceId)>;
+    using DeviceSwitchCallback = std::function<QString(const QString& deviceKey)>;
     void setDeviceListCallback(DeviceListCallback cb) { deviceListCb_ = std::move(cb); }
     void setDeviceSwitchCallback(DeviceSwitchCallback cb) { deviceSwitchCb_ = std::move(cb); }
 
     // Keep current slider values in sync
-    void updateCurrentSettings(int multiple, int bins, int freqMin, int freqMax);
+    void updateCurrentSettings(int multiple, int bins, int freqMin, int freqMax, double baseAFreq = 440.0);
 
 protected:
     void incomingConnection(qintptr socketDescriptor) override;
@@ -84,4 +84,5 @@ private:
     int curBins_ = 200;
     int curFreqMin_ = 100;
     int curFreqMax_ = 3000;
+    double curBaseAFreq_ = 440.0;
 };

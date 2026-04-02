@@ -26,6 +26,8 @@ protected:
     void paintGL() override;
     void resizeEvent(QResizeEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
     void bindQuad(QOpenGLShaderProgram& program);

@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QImage>
 #include <QMatrix4x4>
+#include <QMouseEvent>
 #include <QOpenGLExtraFunctions>
 #include <QPainter>
 #include <QResizeEvent>
@@ -67,6 +68,7 @@ void ensureStorage(QOpenGLTexture*& texture, int widthPx, int heightPx)
 GlSpectrogramCanvas::GlSpectrogramCanvas(SpectrogramWidget* owner)
     : QOpenGLWidget(owner), owner_(owner), quadBuffer_(QOpenGLBuffer::VertexBuffer)
 {
+    setMouseTracking(true);
 }
 
 GlSpectrogramCanvas::~GlSpectrogramCanvas()
@@ -365,10 +367,17 @@ void GlSpectrogramCanvas::initializeGL()
         shared uint sharedIdx[128];
         void main() {
             uint tid = gl_LocalInvocationID.x;
-            uint idx = gl_GlobalInvocationID.x;
-            float amp = (idx < uint(numBins)) ? spectrum[idx] : -1.0;
-            sharedAmp[tid] = amp;
-            sharedIdx[tid] = idx;
+            float bestAmp = -1.0;
+            uint bestIdx = 0u;
+            for (uint idx = tid; idx < uint(numBins); idx += gl_WorkGroupSize.x) {
+                float amp = spectrum[idx];
+                if (amp > bestAmp) {
+                    bestAmp = amp;
+                    bestIdx = idx;
+                }
+            }
+            sharedAmp[tid] = bestAmp;
+            sharedIdx[tid] = bestIdx;
             barrier();
             for (uint stride = 64u; stride > 0u; stride >>= 1u) {
                 if (tid < stride && sharedAmp[tid + stride] > sharedAmp[tid]) {
@@ -446,6 +455,18 @@ void GlSpectrogramCanvas::wheelEvent(QWheelEvent* event)
 {
     owner_->handleWheelZoom(event->position().toPoint(), event->angleDelta().y(), size());
     event->accept();
+}
+
+void GlSpectrogramCanvas::mouseMoveEvent(QMouseEvent* event)
+{
+    owner_->updateHoverCursor(event->position().toPoint(), size());
+    QOpenGLWidget::mouseMoveEvent(event);
+}
+
+void GlSpectrogramCanvas::leaveEvent(QEvent* event)
+{
+    unsetCursor();
+    QOpenGLWidget::leaveEvent(event);
 }
 
 void GlSpectrogramCanvas::bindQuad(QOpenGLShaderProgram& program)
@@ -575,14 +596,11 @@ void GlSpectrogramCanvas::drawHistogram(const QRect& rect, QOpenGLTexture* ampli
         std::vector<unsigned char> amplitudeRgba(nb * 4, 0);
         std::vector<unsigned char> colorRgba(nb * 4, 0);
 
-        float logMax = std::log(1.0f + owner_->maxAmplitude_ * owner_->gain_);
         for (int fi = 0; fi < nb; fi++) {
             int row = (nb - 1 - fi) * 4;
-            float normalized = 0.0f;
-            if (fi < static_cast<int>(owner_->spectrum_.size()) && logMax > 0.0f) {
-                normalized = std::log(1.0f + owner_->spectrum_[fi] * owner_->gain_) / logMax;
-                normalized = std::clamp(normalized, 0.0f, 1.0f);
-            }
+            float normalized = fi < static_cast<int>(owner_->spectrum_.size())
+                ? owner_->visualLevel(owner_->spectrum_[fi])
+                : 0.0f;
             amplitudeRgba[row + 0] = static_cast<unsigned char>(normalized * 255.0f);
             amplitudeRgba[row + 1] = amplitudeRgba[row + 0];
             amplitudeRgba[row + 2] = amplitudeRgba[row + 0];
@@ -701,6 +719,12 @@ bool GlSpectrogramCanvas::ensureDirectGpuResources(const QRect& spectRect, const
         directSpectrogramBack_->bind();
         directSpectrogramBack_->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt8, zeros.data());
         directSpectrogramBack_->release();
+        std::array<float, 4> zeroStats{0.f, 0.f, 1.f, 0.f};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, directBuffers_[DIRECT_BUF_STATS]);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                        0,
+                        static_cast<GLsizeiptr>(zeroStats.size() * sizeof(float)),
+                        zeroStats.data());
         directHistoryRevision_ = owner_->historyRevision_;
         directRollingBootstrapped_ = false;
     }
@@ -810,13 +834,15 @@ bool GlSpectrogramCanvas::runDirectMagnitudeCompute()
 
 bool GlSpectrogramCanvas::updateDirectStatsFromGpu()
 {
+    if (directNumBins_ <= 0) return false;
+
     auto* f = context()->extraFunctions();
     directStatsProgram_.bind();
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, directBuffers_[DIRECT_BUF_SPECTRUM]);
     f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, directBuffers_[DIRECT_BUF_STATS]);
     directStatsProgram_.setUniformValue("numBins", directNumBins_);
     f->glDispatchCompute(1, 1, 1);
-    f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
     directStatsProgram_.release();
     return true;
 }

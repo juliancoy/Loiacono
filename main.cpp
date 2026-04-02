@@ -19,14 +19,18 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <memory>
 
 #include "RtAudio.h"
+#include "audio_device_labels.h"
 #include "loiacono_rolling.h"
 #include "spectrogram_widget.h"
+#include "tone_curve_editor.h"
 #include "api_server.h"
 
 static constexpr const char* APP_ID = "com.loiacono.spectrogram";
@@ -45,6 +49,26 @@ struct SavedUiState {
     int displayTenths = 80;
     int modeIndex = 2;
     int deviceId = -1;
+    int deviceApi = -1;
+    int baseAHundredths = 44000;  // 440.00 Hz default
+    int sampleRate = 48000;
+    int bufferFrames = 256;
+    int bufferCount = 0;
+    int audioFlags = 0;
+    int temporalWeightingMode = static_cast<int>(LoiaconoRolling::WindowMode::RectangularWindow);
+    int normalizationMode = static_cast<int>(LoiaconoRolling::NormalizationMode::Energy);
+    int displayNormalizationMode = static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::SmoothedGlobalMax);
+    int fixedDisplayReferenceTenths = 10;
+    int toneCurveMode = static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma);
+    QJsonArray customToneCurve;
+    QJsonArray toneCurveEditorGeometry;
+};
+
+struct AudioSettings {
+    unsigned int sampleRate = 48000;
+    unsigned int bufferFrames = 256;
+    unsigned int bufferCount = 0;
+    RtAudioStreamFlags flags = 0;
 };
 
 static QString settingsFilePath()
@@ -74,6 +98,23 @@ static SavedUiState loadSavedUiState()
     state.displayTenths = obj.value("displayTenths").toInt(state.displayTenths);
     state.modeIndex = obj.value("modeIndex").toInt(state.modeIndex);
     state.deviceId = obj.value("deviceId").toInt(state.deviceId);
+    state.deviceApi = obj.value("deviceApi").toInt(state.deviceApi);
+    state.baseAHundredths = obj.value("baseAHundredths").toInt(state.baseAHundredths);
+    state.sampleRate = obj.value("sampleRate").toInt(state.sampleRate);
+    state.bufferFrames = obj.value("bufferFrames").toInt(state.bufferFrames);
+    state.bufferCount = obj.value("bufferCount").toInt(state.bufferCount);
+    state.audioFlags = obj.value("audioFlags").toInt(state.audioFlags);
+    state.temporalWeightingMode = obj.value("temporalWeightingMode").toInt(state.temporalWeightingMode);
+    state.normalizationMode = obj.value("normalizationMode").toInt(state.normalizationMode);
+    state.displayNormalizationMode = obj.value("displayNormalizationMode").toInt(state.displayNormalizationMode);
+    state.fixedDisplayReferenceTenths = obj.value("fixedDisplayReferenceTenths").toInt(state.fixedDisplayReferenceTenths);
+    state.toneCurveMode = obj.value("toneCurveMode").toInt(state.toneCurveMode);
+    if (obj.value("customToneCurve").isArray()) {
+        state.customToneCurve = obj.value("customToneCurve").toArray();
+    }
+    if (obj.value("toneCurveEditorGeometry").isArray()) {
+        state.toneCurveEditorGeometry = obj.value("toneCurveEditorGeometry").toArray();
+    }
     return state;
 }
 
@@ -91,6 +132,19 @@ static void saveUiState(const SavedUiState& state)
         {"displayTenths", state.displayTenths},
         {"modeIndex", state.modeIndex},
         {"deviceId", state.deviceId},
+        {"deviceApi", state.deviceApi},
+        {"baseAHundredths", state.baseAHundredths},
+        {"sampleRate", state.sampleRate},
+        {"bufferFrames", state.bufferFrames},
+        {"bufferCount", state.bufferCount},
+        {"audioFlags", state.audioFlags},
+        {"temporalWeightingMode", state.temporalWeightingMode},
+        {"normalizationMode", state.normalizationMode},
+        {"displayNormalizationMode", state.displayNormalizationMode},
+        {"fixedDisplayReferenceTenths", state.fixedDisplayReferenceTenths},
+        {"toneCurveMode", state.toneCurveMode},
+        {"customToneCurve", state.customToneCurve},
+        {"toneCurveEditorGeometry", state.toneCurveEditorGeometry},
     };
 
     QFile file(settingsFilePath());
@@ -129,31 +183,211 @@ static bool ensureSingleInstance(QLockFile& lock, QLocalServer& ipcServer,
 
 // ─── Audio device management ─────────────────────────────────────
 static unsigned int currentDeviceId = 0;
+static RtAudio::Api currentDeviceApi = RtAudio::UNSPECIFIED;
 
-static QString openDevice(RtAudio& adc, unsigned int deviceId,
-                           double sampleRate, LoiaconoRolling* transform)
+struct AudioDeviceChoice {
+    RtAudio::Api api = RtAudio::UNSPECIFIED;
+    unsigned int id = 0;
+    QString backendName;
+    QString rawName;
+    QString displayName;
+    bool isDesktopAudio = false;
+    bool isDefault = false;
+    unsigned int inputChannels = 0;
+    unsigned int outputChannels = 0;
+    unsigned int preferredSampleRate = 0;
+};
+
+static std::vector<AudioDeviceChoice> enumerateAudioDevices()
 {
-    if (adc.isStreamOpen()) { adc.stopStream(); adc.closeStream(); }
+    std::vector<AudioDeviceChoice> devices;
+#if LOIACONO_ENABLE_DESKTOP_AUDIO
+    std::vector<RtAudio::Api> apis;
+    RtAudio::getCompiledApi(apis);
 
-    auto info = adc.getDeviceInfo(deviceId);
-    if (info.inputChannels < 1)
+    for (auto api : apis) {
+        if (api == RtAudio::UNSPECIFIED) continue;
+
+        RtAudio backend(api);
+        unsigned int defaultIn = backend.getDefaultInputDevice();
+        for (auto id : backend.getDeviceIds()) {
+            auto info = backend.getDeviceInfo(id);
+            if (info.inputChannels < 1) continue;
+
+            QString backendName = QString::fromStdString(RtAudio::getApiDisplayName(api));
+            QString rawName = QString::fromStdString(info.name);
+            bool isDesktop = isDesktopAudioDevice(backendName, rawName,
+                                                  info.inputChannels, info.outputChannels);
+            devices.push_back(AudioDeviceChoice{
+                api,
+                id,
+                backendName,
+                rawName,
+                displayNameForDevice(backendName, rawName,
+                                     info.inputChannels, info.outputChannels),
+                isDesktop,
+                id == defaultIn,
+                info.inputChannels,
+                info.outputChannels,
+                info.preferredSampleRate,
+            });
+        }
+    }
+
+    std::stable_sort(devices.begin(), devices.end(), [](const AudioDeviceChoice& a, const AudioDeviceChoice& b) {
+        if (a.isDesktopAudio != b.isDesktopAudio) return a.isDesktopAudio > b.isDesktopAudio;
+        if (a.backendName.contains("Pulse", Qt::CaseInsensitive) != b.backendName.contains("Pulse", Qt::CaseInsensitive)) {
+            return a.backendName.contains("Pulse", Qt::CaseInsensitive);
+        }
+        if (a.isDefault != b.isDefault) return a.isDefault > b.isDefault;
+        return a.displayName.localeAwareCompare(b.displayName) < 0;
+    });
+#else
+    RtAudio backend;
+    unsigned int defaultIn = backend.getDefaultInputDevice();
+    for (auto id : backend.getDeviceIds()) {
+        auto info = backend.getDeviceInfo(id);
+        if (info.inputChannels < 1) continue;
+
+        QString rawName = QString::fromStdString(info.name);
+        devices.push_back(AudioDeviceChoice{
+            RtAudio::UNSPECIFIED,
+            id,
+            QString(),
+            rawName,
+            displayNameForDeviceName(rawName),
+            false,
+            id == defaultIn,
+            info.inputChannels,
+            info.outputChannels,
+            info.preferredSampleRate,
+        });
+    }
+
+    std::stable_sort(devices.begin(), devices.end(), [](const AudioDeviceChoice& a, const AudioDeviceChoice& b) {
+        if (a.isDefault != b.isDefault) return a.isDefault > b.isDefault;
+        return a.displayName.localeAwareCompare(b.displayName) < 0;
+    });
+#endif
+    return devices;
+}
+
+static QString openDevice(std::unique_ptr<RtAudio>& adc, RtAudio::Api api, unsigned int deviceId,
+                           const AudioSettings& settings,
+                           LoiaconoRolling* transform)
+{
+#if !LOIACONO_ENABLE_DESKTOP_AUDIO
+    api = RtAudio::UNSPECIFIED;
+#endif
+    if (!adc || currentDeviceApi != api) {
+        adc = std::make_unique<RtAudio>(api);
+    }
+
+    if (adc->isStreamOpen()) {
+        adc->stopStream();
+        adc->closeStream();
+    }
+
+    auto info = adc->getDeviceInfo(deviceId);
+    if (info.inputChannels < 1) {
         return QString("Error: '%1' has no input").arg(QString::fromStdString(info.name));
+    }
 
     RtAudio::StreamParameters params;
     params.deviceId = deviceId;
     params.nChannels = 1;
-    unsigned int bufferFrames = 256;
+    unsigned int bufferFrames = std::max(16u, settings.bufferFrames);
+    RtAudio::StreamOptions options;
+    options.flags = settings.flags;
+    options.numberOfBuffers = settings.bufferCount;
+    options.streamName = "Loiacono Spectrogram";
+    if (settings.flags & RTAUDIO_SCHEDULE_REALTIME) {
+        options.priority = 10;
+    }
 
-    auto err = adc.openStream(nullptr, &params, RTAUDIO_FLOAT32,
-                   static_cast<unsigned int>(sampleRate),
-                   &bufferFrames, &audioCallback, transform);
+    auto err = adc->openStream(nullptr, &params, RTAUDIO_FLOAT32,
+                   settings.sampleRate,
+                   &bufferFrames, &audioCallback, transform, &options);
     if (err != RTAUDIO_NO_ERROR) return "Error: failed to open stream";
 
-    err = adc.startStream();
+    unsigned int actualSampleRate = adc->getStreamSampleRate();
+    if (actualSampleRate == 0) {
+        actualSampleRate = settings.sampleRate;
+    }
+    if (std::abs(transform->sampleRate() - static_cast<double>(actualSampleRate)) > 0.5) {
+        auto stats = transform->getStats();
+        transform->configure(actualSampleRate,
+                             stats.freqMin,
+                             stats.freqMax,
+                             std::max(1, stats.currentBins),
+                             std::max(2, stats.currentMultiple));
+    }
+
+    err = adc->startStream();
     if (err != RTAUDIO_NO_ERROR) return "Error: failed to start stream";
 
     currentDeviceId = deviceId;
-    return QString::fromStdString(info.name);
+    currentDeviceApi = api;
+#if LOIACONO_ENABLE_DESKTOP_AUDIO
+    QString backendName = QString::fromStdString(RtAudio::getApiDisplayName(api));
+    QString sampleRateText = actualSampleRate == settings.sampleRate
+        ? QString("%1 Hz").arg(actualSampleRate)
+        : QString("%1 Hz requested, %2 Hz actual").arg(settings.sampleRate).arg(actualSampleRate);
+    return QString("%1 | %2 | %3 | %4 frames | %5 bufs | %6 frame latency")
+        .arg(displayNameForDevice(backendName, QString::fromStdString(info.name),
+                                  info.inputChannels, info.outputChannels))
+        .arg(backendName)
+        .arg(sampleRateText)
+        .arg(bufferFrames)
+        .arg(options.numberOfBuffers)
+        .arg(adc->getStreamLatency());
+#else
+    QString sampleRateText = actualSampleRate == settings.sampleRate
+        ? QString("%1 Hz").arg(actualSampleRate)
+        : QString("%1 Hz requested, %2 Hz actual").arg(settings.sampleRate).arg(actualSampleRate);
+    return QString("%1 | %2 | %3 frames | %4 bufs | %5 frame latency")
+        .arg(displayNameForDeviceName(QString::fromStdString(info.name)))
+        .arg(sampleRateText)
+        .arg(bufferFrames)
+        .arg(options.numberOfBuffers)
+        .arg(adc->getStreamLatency());
+#endif
+}
+
+static QString encodeDeviceKey(RtAudio::Api api, unsigned int id)
+{
+    return QString("%1:%2").arg(static_cast<int>(api)).arg(id);
+}
+
+static bool decodeDeviceKey(const QVariant& data, RtAudio::Api* api, unsigned int* id)
+{
+    QString key = data.toString();
+    QStringList parts = key.split(':');
+    if (parts.size() != 2) return false;
+
+    bool apiOk = false;
+    bool idOk = false;
+    int apiValue = parts[0].toInt(&apiOk);
+    unsigned int deviceId = parts[1].toUInt(&idOk);
+    if (!apiOk || !idOk) return false;
+
+    *api = static_cast<RtAudio::Api>(apiValue);
+    *id = deviceId;
+    return true;
+}
+
+static QJsonArray rectToJson(const QRect& rect)
+{
+    return QJsonArray{rect.x(), rect.y(), rect.width(), rect.height()};
+}
+
+static QRect rectFromJson(const QJsonArray& arr, const QRect& fallback)
+{
+    if (arr.size() != 4) return fallback;
+    return QRect(arr[0].toInt(fallback.x()),
+                 arr[1].toInt(fallback.y()),
+                 arr[2].toInt(fallback.width()),
+                 arr[3].toInt(fallback.height()));
 }
 
 // ─── Slider factory ──────────────────────────────────────────────
@@ -233,14 +467,32 @@ int main(int argc, char* argv[])
 
     // Transform
     LoiaconoRolling transform;
-    double sampleRate = 48000;
     SavedUiState savedState = loadSavedUiState();
+    AudioSettings audioSettings;
+    audioSettings.sampleRate = static_cast<unsigned int>(std::clamp(savedState.sampleRate, 8000, 192000));
+    audioSettings.bufferFrames = static_cast<unsigned int>(std::clamp(savedState.bufferFrames, 16, 4096));
+    audioSettings.bufferCount = static_cast<unsigned int>(std::clamp(savedState.bufferCount, 0, 8));
+    audioSettings.flags = static_cast<RtAudioStreamFlags>(savedState.audioFlags);
     int freqMin = std::clamp(savedState.freqMin, 20, 2000);
     int freqMax = std::clamp(savedState.freqMax, 500, 12000);
-    int numBins = std::clamp(savedState.bins, 32, 1200);
-    int multiple = std::clamp(savedState.multiple, 2, 120);
+    int numBins = std::clamp(savedState.bins, 32, 2400);
+    int multiple = std::clamp(savedState.multiple, 2, 240);
     if (freqMin >= freqMax - 50) freqMax = std::min(12000, freqMin + 50);
-    transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
+    auto temporalWeightingMode = static_cast<LoiaconoRolling::WindowMode>(
+        std::clamp(savedState.temporalWeightingMode,
+                   static_cast<int>(LoiaconoRolling::WindowMode::RectangularWindow),
+                   static_cast<int>(LoiaconoRolling::WindowMode::LeakyWindow)));
+    auto normalizationMode = static_cast<LoiaconoRolling::NormalizationMode>(
+        std::clamp(savedState.normalizationMode,
+                   static_cast<int>(LoiaconoRolling::NormalizationMode::RawSum),
+                   static_cast<int>(LoiaconoRolling::NormalizationMode::Energy)));
+    auto toneCurveMode = static_cast<SpectrogramWidget::ToneCurveMode>(
+        std::clamp(savedState.toneCurveMode,
+                   static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma),
+                   static_cast<int>(SpectrogramWidget::ToneCurveMode::CustomCurve)));
+    transform.setWindowMode(temporalWeightingMode);
+    transform.setNormalizationMode(normalizationMode);
+    transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
 
     auto* window = new QMainWindow;
     window->setWindowTitle("Loiacono Transform");
@@ -282,15 +534,15 @@ int main(int argc, char* argv[])
     auto* row1Lay = new QHBoxLayout(row1);
     row1Lay->setContentsMargins(4, 2, 4, 2);
     row1Lay->setSpacing(12);
-    row1Lay->addWidget(makeSlider("Multiple", slMultiple, 2, 120, multiple, " periods", lbMultiple));
-    row1Lay->addWidget(makeSlider("Bins", slBins, 32, 1200, numBins, "", lbBins));
+    row1Lay->addWidget(makeSlider("Multiple", slMultiple, 2, 240, multiple, " periods", lbMultiple));
+    row1Lay->addWidget(makeSlider("Bins", slBins, 32, 2400, numBins, "", lbBins));
     row1Lay->addWidget(makeSlider("Freq min", slMin, 20, 2000, freqMin, " Hz", lbMin));
     row1Lay->addWidget(makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax));
     mainLayout->addWidget(row1, 0);  // 0 stretch factor - fixed size
 
     // ── Settings row 2: Visual tuning ──
-    QSlider *slGain, *slGamma, *slFloor, *slLeakiness, *slDisplaySeconds;
-    QLabel *lbGain, *lbGamma, *lbFloor, *lbLeakiness, *lbDisplaySeconds;
+    QSlider *slGain, *slGamma, *slFloor, *slLeakiness, *slDisplaySeconds, *slBaseA, *slDisplayReference;
+    QLabel *lbGain, *lbGamma, *lbFloor, *lbLeakiness, *lbDisplaySeconds, *lbBaseA, *lbDisplayReference;
 
     auto* row2 = new QWidget;
     row2->setMaximumHeight(40);  // Prevent row from expanding
@@ -305,6 +557,11 @@ int main(int argc, char* argv[])
     double initialLeakage = (10000 - slLeakiness->value()) / 100.0;
     lbLeakiness->setText(QString("Leak: %1%").arg(initialLeakage, 0, 'f', 2));
     row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, std::clamp(savedState.displayTenths, 10, 300), 10.0f, " s"));
+    row2Lay->addWidget(makeFloatSlider("Disp ref", slDisplayReference, lbDisplayReference, 1, 1000, std::clamp(savedState.fixedDisplayReferenceTenths, 1, 1000), 10.0f, ""));
+    // Base A frequency slider (400-500 Hz range)
+    int baseAValue = std::clamp(savedState.baseAHundredths, 40000, 50000);
+    row2Lay->addWidget(makeFloatSlider("Base A", slBaseA, lbBaseA, 40000, 50000, baseAValue, 100.0f, " Hz"));
+    transform.setBaseAFrequency(baseAValue / 100.0);
     mainLayout->addWidget(row2, 0);  // 0 stretch factor - fixed size
 
     // ── Settings row 3: Input + execution/display mode ──
@@ -321,6 +578,52 @@ int main(int argc, char* argv[])
     devCombo->setStyleSheet(comboStyle);
     auto* modeCombo = new QComboBox;
     modeCombo->setStyleSheet(comboStyle);
+    auto* temporalWeightingCombo = new QComboBox;
+    temporalWeightingCombo->setStyleSheet(comboStyle);
+    auto* normalizationCombo = new QComboBox;
+    normalizationCombo->setStyleSheet(comboStyle);
+    auto* toneCurveCombo = new QComboBox;
+    toneCurveCombo->setStyleSheet(comboStyle);
+    auto* displayNormalizationCombo = new QComboBox;
+    displayNormalizationCombo->setStyleSheet(comboStyle);
+    auto* sampleRateCombo = new QComboBox;
+    sampleRateCombo->setStyleSheet(comboStyle);
+    auto* bufferFramesCombo = new QComboBox;
+    bufferFramesCombo->setStyleSheet(comboStyle);
+    auto* bufferCountCombo = new QComboBox;
+    bufferCountCombo->setStyleSheet(comboStyle);
+    auto* cbMinLatency = new QCheckBox("Min latency");
+    auto* cbRealtime = new QCheckBox("Realtime");
+    auto* cbExclusive = new QCheckBox("Exclusive");
+    auto* cbAlsaDefault = new QCheckBox("ALSA default");
+    for (auto* cb : {cbMinLatency, cbRealtime, cbExclusive, cbAlsaDefault}) {
+        cb->setStyleSheet("QCheckBox { color: #b0c0e0; font-size: 11px; }");
+    }
+
+    const std::vector<unsigned int> sampleRates = {8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192000};
+    for (unsigned int rate : sampleRates) {
+        sampleRateCombo->addItem(QString::number(rate), static_cast<int>(rate));
+    }
+    int sampleRateIndex = sampleRateCombo->findData(static_cast<int>(audioSettings.sampleRate));
+    sampleRateCombo->setCurrentIndex(sampleRateIndex >= 0 ? sampleRateIndex : sampleRateCombo->findData(48000));
+
+    const std::vector<unsigned int> bufferFrameOptions = {16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+    for (unsigned int frames : bufferFrameOptions) {
+        bufferFramesCombo->addItem(QString::number(frames), static_cast<int>(frames));
+    }
+    int bufferFramesIndex = bufferFramesCombo->findData(static_cast<int>(audioSettings.bufferFrames));
+    bufferFramesCombo->setCurrentIndex(bufferFramesIndex >= 0 ? bufferFramesIndex : bufferFramesCombo->findData(256));
+
+    bufferCountCombo->addItem("Auto", 0);
+    for (int count = 2; count <= 8; ++count) {
+        bufferCountCombo->addItem(QString::number(count), count);
+    }
+    int bufferCountIndex = bufferCountCombo->findData(static_cast<int>(audioSettings.bufferCount));
+    bufferCountCombo->setCurrentIndex(bufferCountIndex >= 0 ? bufferCountIndex : 0);
+    cbMinLatency->setChecked(audioSettings.flags & RTAUDIO_MINIMIZE_LATENCY);
+    cbRealtime->setChecked(audioSettings.flags & RTAUDIO_SCHEDULE_REALTIME);
+    cbExclusive->setChecked(audioSettings.flags & RTAUDIO_HOG_DEVICE);
+    cbAlsaDefault->setChecked(audioSettings.flags & RTAUDIO_ALSA_USE_DEFAULT);
     auto addMode = [&](const QString& label, LoiaconoRolling::ComputeMode computeMode, bool gpuDisplay) {
         int packed = (static_cast<int>(computeMode) << 1) | (gpuDisplay ? 1 : 0);
         modeCombo->addItem(label, packed);
@@ -331,7 +634,34 @@ int main(int argc, char* argv[])
     addMode("Multi-thread + GPU display", LoiaconoRolling::ComputeMode::MultiThread, true);
     addMode("GPU compute + CPU display", LoiaconoRolling::ComputeMode::GpuCompute, false);
     addMode("GPU compute + GPU display", LoiaconoRolling::ComputeMode::GpuCompute, true);
+    addMode("Vulkan compute + CPU display", LoiaconoRolling::ComputeMode::VulkanCompute, false);
+    addMode("Vulkan compute + GPU display", LoiaconoRolling::ComputeMode::VulkanCompute, true);
     modeCombo->setCurrentIndex(std::clamp(savedState.modeIndex, 0, modeCombo->count() - 1));
+    temporalWeightingCombo->addItem("Rectangular", static_cast<int>(LoiaconoRolling::WindowMode::RectangularWindow));
+    temporalWeightingCombo->addItem("Hann", static_cast<int>(LoiaconoRolling::WindowMode::HannWindow));
+    temporalWeightingCombo->addItem("Hamming", static_cast<int>(LoiaconoRolling::WindowMode::HammingWindow));
+    temporalWeightingCombo->addItem("Blackman", static_cast<int>(LoiaconoRolling::WindowMode::BlackmanWindow));
+    temporalWeightingCombo->addItem("Blackman-Harris", static_cast<int>(LoiaconoRolling::WindowMode::BlackmanHarrisWindow));
+    temporalWeightingCombo->addItem("Leaky", static_cast<int>(LoiaconoRolling::WindowMode::LeakyWindow));
+    temporalWeightingCombo->setCurrentIndex(
+        std::max(0, temporalWeightingCombo->findData(static_cast<int>(temporalWeightingMode))));
+    normalizationCombo->addItem("Raw sum", static_cast<int>(LoiaconoRolling::NormalizationMode::RawSum));
+    normalizationCombo->addItem("Coherent amplitude", static_cast<int>(LoiaconoRolling::NormalizationMode::CoherentAmplitude));
+    normalizationCombo->addItem("Energy", static_cast<int>(LoiaconoRolling::NormalizationMode::Energy));
+    normalizationCombo->setCurrentIndex(
+        std::max(0, normalizationCombo->findData(static_cast<int>(normalizationMode))));
+    toneCurveCombo->addItem("Power gamma", static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma));
+    toneCurveCombo->addItem("Smoothstep", static_cast<int>(SpectrogramWidget::ToneCurveMode::Smoothstep));
+    toneCurveCombo->addItem("Sigmoid", static_cast<int>(SpectrogramWidget::ToneCurveMode::Sigmoid));
+    toneCurveCombo->addItem("Custom curve", static_cast<int>(SpectrogramWidget::ToneCurveMode::CustomCurve));
+    toneCurveCombo->setCurrentIndex(
+        std::max(0, toneCurveCombo->findData(static_cast<int>(toneCurveMode))));
+    displayNormalizationCombo->addItem("Smoothed max", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::SmoothedGlobalMax));
+    displayNormalizationCombo->addItem("Per-frame max", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::PerFrameMax));
+    displayNormalizationCombo->addItem("Peak-hold decay", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::PeakHoldDecay));
+    displayNormalizationCombo->addItem("Fixed reference", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::FixedReference));
+    displayNormalizationCombo->setCurrentIndex(
+        std::max(0, displayNormalizationCombo->findData(savedState.displayNormalizationMode)));
 
     auto addLabeledField = [&](const QString& labelText, QWidget* field) {
         auto* box = new QWidget;
@@ -347,20 +677,78 @@ int main(int argc, char* argv[])
 
     row3Lay->addWidget(addLabeledField("Input device", devCombo), 1);
     row3Lay->addWidget(addLabeledField("Execution mode", modeCombo));
+    row3Lay->addWidget(addLabeledField("Sample rate", sampleRateCombo));
+    row3Lay->addWidget(addLabeledField("Buffer frames", bufferFramesCombo));
+    row3Lay->addWidget(addLabeledField("Buffer count", bufferCountCombo));
     mainLayout->addWidget(row3, 0);  // 0 stretch factor - fixed size
+
+    auto* row4 = new QWidget;
+    row4->setMaximumHeight(60);
+    auto* row4Lay = new QHBoxLayout(row4);
+    row4Lay->setContentsMargins(4, 2, 4, 2);
+    row4Lay->setSpacing(12);
+    row4Lay->addWidget(addLabeledField("Windowing", temporalWeightingCombo));
+    row4Lay->addWidget(addLabeledField("Normalization", normalizationCombo));
+    row4Lay->addWidget(addLabeledField("Display norm", displayNormalizationCombo));
+    row4Lay->addWidget(addLabeledField("Tone curve", toneCurveCombo));
+    row4Lay->addWidget(cbMinLatency);
+    row4Lay->addWidget(cbRealtime);
+    row4Lay->addWidget(cbExclusive);
+    row4Lay->addWidget(cbAlsaDefault);
+    row4Lay->addStretch(1);
+    mainLayout->addWidget(row4, 0);
 
     // ── Spectrogram ──
     auto* spectrogram = new SpectrogramWidget(&transform);
     spectrogram->setGain(slGain->value() / 10.0f);
     spectrogram->setGamma(slGamma->value() / 100.0f);
     spectrogram->setFloor(slFloor->value() / 100.0f);
+    spectrogram->setDisplayNormalizationMode(static_cast<SpectrogramWidget::DisplayNormalizationMode>(
+        displayNormalizationCombo->currentData().toInt()));
+    spectrogram->setFixedDisplayReference(slDisplayReference->value() / 10.0f);
+    spectrogram->setToneCurveMode(toneCurveMode);
+    spectrogram->setCustomToneCurveJson(savedState.customToneCurve);
     transform.setLeakiness(slLeakiness->value() / 10000.0);
     spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
     mainLayout->addWidget(spectrogram, 1);
 
+    auto* toneCurveEditor = new ToneCurveEditorDialog(window);
+    toneCurveEditor->setControlPoints(spectrogram->customToneCurve());
+    toneCurveEditor->setGeometry(rectFromJson(savedState.toneCurveEditorGeometry, toneCurveEditor->geometry()));
+    auto* toneCurveButton = new QPushButton("Curves...");
+    toneCurveButton->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 8px; }");
+    row4Lay->addWidget(toneCurveButton);
+
     window->setCentralWidget(central);
     auto* statusBar = window->statusBar();
     statusBar->setStyleSheet("font-size: 11px; color: #607090;");
+
+    auto updateLeakinessLabel = [&]() {
+        double leakagePercent = (10000 - slLeakiness->value()) / 100.0;
+        bool leakyModeSelected = static_cast<LoiaconoRolling::WindowMode>(
+            temporalWeightingCombo->currentData().toInt()) == LoiaconoRolling::WindowMode::LeakyWindow;
+        slLeakiness->setEnabled(leakyModeSelected);
+        lbLeakiness->setEnabled(leakyModeSelected);
+        lbLeakiness->setText(leakyModeSelected
+            ? QString("Leak: %1%").arg(leakagePercent, 0, 'f', 2)
+            : QString("Leak: off (rect)"));
+    };
+
+    auto updateDisplayReferenceUi = [&]() {
+        bool fixedMode = static_cast<SpectrogramWidget::DisplayNormalizationMode>(
+            displayNormalizationCombo->currentData().toInt()) == SpectrogramWidget::DisplayNormalizationMode::FixedReference;
+        slDisplayReference->setEnabled(fixedMode);
+        lbDisplayReference->setEnabled(fixedMode);
+    };
+
+    auto updateToneCurveUi = [&]() {
+        auto mode = static_cast<SpectrogramWidget::ToneCurveMode>(toneCurveCombo->currentData().toInt());
+        bool gammaDriven = mode != SpectrogramWidget::ToneCurveMode::CustomCurve;
+        slGamma->setEnabled(gammaDriven);
+        lbGamma->setEnabled(gammaDriven);
+        toneCurveButton->setEnabled(true);
+        toneCurveButton->setText(mode == SpectrogramWidget::ToneCurveMode::CustomCurve ? "Edit curve..." : "Curves...");
+    };
 
     auto saveStateNow = [&]() {
         SavedUiState current;
@@ -372,9 +760,30 @@ int main(int argc, char* argv[])
         current.gammaHundredths = slGamma->value();
         current.floorHundredths = slFloor->value();
         current.leakinessHundredths = slLeakiness->value();
-        current.displayTenths = slDisplaySeconds->value();
+        current.displayTenths = static_cast<int>(std::lround(spectrogram->displayedTimeSeconds() * 10.0));
+        current.baseAHundredths = slBaseA->value();
         current.modeIndex = modeCombo->currentIndex();
-        current.deviceId = devCombo->currentIndex() >= 0 ? devCombo->currentData().toInt() : currentDeviceId;
+        current.deviceId = static_cast<int>(currentDeviceId);
+        current.deviceApi = static_cast<int>(currentDeviceApi);
+        if (devCombo->currentIndex() >= 0) {
+            RtAudio::Api api = RtAudio::UNSPECIFIED;
+            unsigned int deviceId = 0;
+            if (decodeDeviceKey(devCombo->currentData(), &api, &deviceId)) {
+                current.deviceId = static_cast<int>(deviceId);
+                current.deviceApi = static_cast<int>(api);
+            }
+        }
+        current.sampleRate = static_cast<int>(audioSettings.sampleRate);
+        current.bufferFrames = static_cast<int>(audioSettings.bufferFrames);
+        current.bufferCount = static_cast<int>(audioSettings.bufferCount);
+        current.audioFlags = static_cast<int>(audioSettings.flags);
+        current.temporalWeightingMode = temporalWeightingCombo->currentData().toInt();
+        current.normalizationMode = normalizationCombo->currentData().toInt();
+        current.displayNormalizationMode = displayNormalizationCombo->currentData().toInt();
+        current.fixedDisplayReferenceTenths = slDisplayReference->value();
+        current.toneCurveMode = toneCurveCombo->currentData().toInt();
+        current.customToneCurve = spectrogram->customToneCurveJson();
+        current.toneCurveEditorGeometry = rectToJson(toneCurveEditor->geometry());
         saveUiState(current);
     };
 
@@ -385,7 +794,16 @@ int main(int argc, char* argv[])
         freqMin = slMin->value();
         freqMax = slMax->value();
         if (freqMin >= freqMax - 50) freqMax = freqMin + 50;
-        transform.configure(sampleRate, freqMin, freqMax, numBins, multiple);
+        transform.setWindowMode(static_cast<LoiaconoRolling::WindowMode>(
+            temporalWeightingCombo->currentData().toInt()));
+        transform.setNormalizationMode(static_cast<LoiaconoRolling::NormalizationMode>(
+            normalizationCombo->currentData().toInt()));
+        transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
+        spectrogram->setDisplayNormalizationMode(static_cast<SpectrogramWidget::DisplayNormalizationMode>(
+            displayNormalizationCombo->currentData().toInt()));
+        spectrogram->setFixedDisplayReference(slDisplayReference->value() / 10.0f);
+        spectrogram->setToneCurveMode(static_cast<SpectrogramWidget::ToneCurveMode>(
+            toneCurveCombo->currentData().toInt()));
         spectrogram->resetHistory();
         saveStateNow();
     };
@@ -404,22 +822,33 @@ int main(int argc, char* argv[])
     QObject::connect(slFloor, &QSlider::valueChanged, [spectrogram](int v) {
         spectrogram->setFloor(v / 100.0f);
     });
+    QObject::connect(slDisplayReference, &QSlider::valueChanged, [spectrogram, saveStateNow](int v) {
+        spectrogram->setFixedDisplayReference(v / 10.0f);
+        saveStateNow();
+    });
     QObject::connect(slLeakiness, &QSlider::valueChanged, [&transform, lbLeakiness, saveStateNow](int v) {
         transform.setLeakiness(v / 10000.0);
-        // Update label to show percentage
-        double leakagePercent = (10000 - v) / 100.0;
-        lbLeakiness->setText(QString("Leak: %1%").arg(leakagePercent, 0, 'f', 2));
         saveStateNow();
     });
     QObject::connect(slDisplaySeconds, &QSlider::valueChanged, [spectrogram](int v) {
         spectrogram->setDisplayedTimeSeconds(v / 10.0);
     });
-    spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
-    QObject::connect(spectrogram, &SpectrogramWidget::displayedTimeChanged, [slDisplaySeconds](double seconds) {
+    QObject::connect(slBaseA, &QSlider::valueChanged, [&transform, lbBaseA, saveStateNow](int v) {
+        double freq = v / 100.0;
+        transform.setBaseAFrequency(freq);
+        lbBaseA->setText(QString("Base A: %1 Hz").arg(freq, 0, 'f', 2));
+        saveStateNow();
+    });
+    QObject::connect(spectrogram, &SpectrogramWidget::displayedTimeChanged, [slDisplaySeconds, saveStateNow](double seconds) {
         int sliderValue = static_cast<int>(std::lround(seconds * 10.0));
         sliderValue = std::clamp(sliderValue, slDisplaySeconds->minimum(), slDisplaySeconds->maximum());
-        slDisplaySeconds->setValue(sliderValue);
+        if (slDisplaySeconds->value() != sliderValue) {
+            QSignalBlocker blocker(slDisplaySeconds);
+            slDisplaySeconds->setValue(sliderValue);
+        }
+        saveStateNow();
     });
+    spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
     QObject::connect(spectrogram, &SpectrogramWidget::frequencyRangeChanged, [slMin, slMax](int newMin, int newMax) {
         slMin->setValue(std::clamp(newMin, slMin->minimum(), slMin->maximum()));
         slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
@@ -435,6 +864,8 @@ int main(int argc, char* argv[])
         QString message = QString("Mode: %1").arg(modeCombo->itemText(index));
         if (mode == LoiaconoRolling::ComputeMode::GpuCompute && !transform.gpuComputeAvailable()) {
             message += " | GPU compute unavailable, using multi-thread CPU";
+        } else if (mode == LoiaconoRolling::ComputeMode::VulkanCompute && !transform.vulkanComputeAvailable()) {
+            message += " | Vulkan compute unavailable, using multi-thread CPU";
         }
         statusBar->showMessage(message);
         saveStateNow();
@@ -443,46 +874,132 @@ int main(int argc, char* argv[])
     emit modeCombo->currentIndexChanged(modeCombo->currentIndex());
 
     // ── Audio ──
-    RtAudio adc;
+    std::unique_ptr<RtAudio> adc;
     auto populateDevices = [&]() {
         devCombo->clear();
-        auto ids = adc.getDeviceIds();
-        unsigned int defaultIn = adc.getDefaultInputDevice();
         int selectIdx = -1;
-        for (auto id : ids) {
-            auto info = adc.getDeviceInfo(id);
-            if (info.inputChannels < 1) continue;
-            QString name = QString::fromStdString(info.name);
-            devCombo->addItem(name, id);
-            if (static_cast<int>(id) == savedState.deviceId) selectIdx = devCombo->count() - 1;
-            else if (selectIdx < 0 && id == defaultIn) selectIdx = devCombo->count() - 1;
+        auto devices = enumerateAudioDevices();
+        for (const auto& device : devices) {
+            devCombo->addItem(device.displayName, encodeDeviceKey(device.api, device.id));
+            devCombo->setItemData(devCombo->count() - 1, device.rawName, Qt::UserRole + 1);
+            devCombo->setItemData(devCombo->count() - 1, device.backendName, Qt::UserRole + 2);
+            if (static_cast<int>(device.id) == savedState.deviceId
+                && (savedState.deviceApi < 0 || static_cast<int>(device.api) == savedState.deviceApi)) {
+                selectIdx = devCombo->count() - 1;
+            } else if (selectIdx < 0 && device.isDesktopAudio) {
+                selectIdx = devCombo->count() - 1;
+            } else if (selectIdx < 0 && device.isDefault) {
+                selectIdx = devCombo->count() - 1;
+            }
         }
         if (selectIdx >= 0) devCombo->setCurrentIndex(selectIdx);
     };
     populateDevices();
 
+    auto applyAudioSettings = [&]() {
+        audioSettings.sampleRate = static_cast<unsigned int>(sampleRateCombo->currentData().toInt());
+        audioSettings.bufferFrames = static_cast<unsigned int>(bufferFramesCombo->currentData().toInt());
+        audioSettings.bufferCount = static_cast<unsigned int>(bufferCountCombo->currentData().toInt());
+        int flags = 0;
+        if (cbMinLatency->isChecked()) flags |= RTAUDIO_MINIMIZE_LATENCY;
+        if (cbRealtime->isChecked()) flags |= RTAUDIO_SCHEDULE_REALTIME;
+        if (cbExclusive->isChecked()) flags |= RTAUDIO_HOG_DEVICE;
+        if (cbAlsaDefault->isChecked()) flags |= RTAUDIO_ALSA_USE_DEFAULT;
+        audioSettings.flags = static_cast<RtAudioStreamFlags>(flags);
+
+        transform.setWindowMode(static_cast<LoiaconoRolling::WindowMode>(
+            temporalWeightingCombo->currentData().toInt()));
+        transform.setNormalizationMode(static_cast<LoiaconoRolling::NormalizationMode>(
+            normalizationCombo->currentData().toInt()));
+        transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
+        spectrogram->resetHistory();
+        if (devCombo->currentIndex() >= 0) {
+            RtAudio::Api api = RtAudio::UNSPECIFIED;
+            unsigned int devId = 0;
+            if (decodeDeviceKey(devCombo->currentData(), &api, &devId)) {
+                QString result = openDevice(adc, api, devId, audioSettings, &transform);
+                statusBar->showMessage(result);
+            }
+        }
+        updateLeakinessLabel();
+        saveStateNow();
+    };
+
     auto switchDevice = [&](int comboIdx) {
         if (comboIdx < 0) return;
-        unsigned int devId = devCombo->itemData(comboIdx).toUInt();
-        QString result = openDevice(adc, devId, sampleRate, &transform);
+        RtAudio::Api api = RtAudio::UNSPECIFIED;
+        unsigned int devId = 0;
+        if (!decodeDeviceKey(devCombo->itemData(comboIdx), &api, &devId)) return;
+        QString result = openDevice(adc, api, devId, audioSettings, &transform);
         statusBar->showMessage(result);
         saveStateNow();
     };
     QObject::connect(devCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), switchDevice);
+    QObject::connect(sampleRateCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) { applyAudioSettings(); });
+    QObject::connect(bufferFramesCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) { applyAudioSettings(); });
+    QObject::connect(bufferCountCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) { applyAudioSettings(); });
+    QObject::connect(temporalWeightingCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        updateLeakinessLabel();
+        reconfigure();
+        saveStateNow();
+    });
+    QObject::connect(normalizationCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        reconfigure();
+        saveStateNow();
+    });
+    QObject::connect(toneCurveCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        spectrogram->setToneCurveMode(static_cast<SpectrogramWidget::ToneCurveMode>(
+            toneCurveCombo->currentData().toInt()));
+        updateToneCurveUi();
+        spectrogram->resetHistory();
+        saveStateNow();
+    });
+    QObject::connect(displayNormalizationCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        spectrogram->setDisplayNormalizationMode(static_cast<SpectrogramWidget::DisplayNormalizationMode>(
+            displayNormalizationCombo->currentData().toInt()));
+        updateDisplayReferenceUi();
+        spectrogram->resetHistory();
+        saveStateNow();
+    });
+    QObject::connect(toneCurveButton, &QPushButton::clicked, [=]() {
+        toneCurveEditor->setControlPoints(spectrogram->customToneCurve());
+        toneCurveEditor->show();
+        toneCurveEditor->raise();
+        toneCurveEditor->activateWindow();
+    });
+    QObject::connect(toneCurveEditor, &ToneCurveEditorDialog::curveChanged, [&](const std::vector<QPointF>& points) {
+        spectrogram->setCustomToneCurve(points);
+        if (spectrogram->toneCurveMode() == SpectrogramWidget::ToneCurveMode::CustomCurve) {
+            spectrogram->resetHistory();
+        }
+        saveStateNow();
+    });
+    QObject::connect(cbMinLatency, &QCheckBox::toggled, [&](bool) { applyAudioSettings(); });
+    QObject::connect(cbRealtime, &QCheckBox::toggled, [&](bool) { applyAudioSettings(); });
+    QObject::connect(cbExclusive, &QCheckBox::toggled, [&](bool) { applyAudioSettings(); });
+    QObject::connect(cbAlsaDefault, &QCheckBox::toggled, [&](bool) { applyAudioSettings(); });
+    QObject::connect(slLeakiness, &QSlider::valueChanged, [&](int) { updateLeakinessLabel(); });
+    updateLeakinessLabel();
+    updateDisplayReferenceUi();
+    updateToneCurveUi();
 
     // Open default device
-    if (adc.getDeviceCount() > 0 && devCombo->currentIndex() >= 0) {
-        QString result = openDevice(adc, devCombo->currentData().toUInt(), sampleRate, &transform);
-        statusBar->showMessage(result);
+    if (devCombo->currentIndex() >= 0) {
+        RtAudio::Api api = RtAudio::UNSPECIFIED;
+        unsigned int devId = 0;
+        if (decodeDeviceKey(devCombo->currentData(), &api, &devId)) {
+            QString result = openDevice(adc, api, devId, audioSettings, &transform);
+            statusBar->showMessage(result);
+        }
     } else {
         statusBar->showMessage("No audio devices found");
     }
 
     // ── REST API ──
     auto* api = new ApiServer(&transform, spectrogram, &app);
-    api->updateCurrentSettings(multiple, numBins, freqMin, freqMax);
+    api->updateCurrentSettings(multiple, numBins, freqMin, freqMax, transform.baseAFrequency());
 
-    auto syncApi = [&]() { api->updateCurrentSettings(multiple, numBins, freqMin, freqMax); };
+    auto syncApi = [&]() { api->updateCurrentSettings(multiple, numBins, freqMin, freqMax, transform.baseAFrequency()); };
     QObject::connect(slMultiple, &QSlider::valueChanged, syncApi);
     QObject::connect(slBins, &QSlider::valueChanged, syncApi);
     QObject::connect(slMin, &QSlider::valueChanged, syncApi);
@@ -493,27 +1010,33 @@ int main(int argc, char* argv[])
         slMin->setValue(fmin); slMax->setValue(fmax);
     });
 
-    api->setDeviceListCallback([&adc]() -> QJsonArray {
+    api->setDeviceListCallback([]() -> QJsonArray {
         QJsonArray arr;
-        auto ids = adc.getDeviceIds();
-        unsigned int defaultIn = adc.getDefaultInputDevice();
-        for (auto id : ids) {
-            auto info = adc.getDeviceInfo(id);
-            if (info.inputChannels < 1) continue;
+        for (const auto& device : enumerateAudioDevices()) {
             arr.append(QJsonObject{
-                {"id", static_cast<int>(id)},
-                {"name", QString::fromStdString(info.name)},
-                {"channels", static_cast<int>(info.inputChannels)},
-                {"sampleRate", static_cast<int>(info.preferredSampleRate)},
-                {"isDefault", id == defaultIn},
-                {"isActive", id == currentDeviceId},
+                {"id", encodeDeviceKey(device.api, device.id)},
+                {"deviceId", static_cast<int>(device.id)},
+                {"api", static_cast<int>(device.api)},
+                {"apiName", device.backendName},
+                {"name", device.displayName},
+                {"rawName", device.rawName},
+                {"channels", static_cast<int>(device.inputChannels)},
+                {"sampleRate", static_cast<int>(device.preferredSampleRate)},
+                {"isDefault", device.isDefault},
+                {"isDesktopAudio", device.isDesktopAudio},
+                {"isActive", device.id == currentDeviceId && device.api == currentDeviceApi},
             });
         }
         return arr;
     });
 
-    api->setDeviceSwitchCallback([&](unsigned int deviceId) -> QString {
-        QString result = openDevice(adc, deviceId, sampleRate, &transform);
+    api->setDeviceSwitchCallback([&](const QString& deviceKey) -> QString {
+        RtAudio::Api api = RtAudio::UNSPECIFIED;
+        unsigned int deviceId = 0;
+        if (!decodeDeviceKey(deviceKey, &api, &deviceId)) {
+            return "Error: invalid device id";
+        }
+        QString result = openDevice(adc, api, deviceId, audioSettings, &transform);
         statusBar->showMessage(result);
         return result;
     });
@@ -531,6 +1054,6 @@ int main(int argc, char* argv[])
     window->show();
     int ret = app.exec();
     saveStateNow();
-    if (adc.isStreamOpen()) adc.closeStream();
+    if (adc && adc->isStreamOpen()) adc->closeStream();
     return ret;
 }

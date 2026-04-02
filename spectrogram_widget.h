@@ -4,11 +4,13 @@
 #include <QTimer>
 #include <QRect>
 #include <QPoint>
+#include <QJsonArray>
 #include <vector>
 #include "loiacono_rolling.h"
 
 class QPainter;
 class QWheelEvent;
+class QMouseEvent;
 
 // Combined spectrogram + histogram widget
 // Left: scrolling spectrogram (time on X, freq on Y)
@@ -18,6 +20,20 @@ class QWheelEvent;
 class SpectrogramWidget : public QWidget {
     Q_OBJECT
 public:
+    enum class DisplayNormalizationMode {
+        SmoothedGlobalMax,
+        PerFrameMax,
+        PeakHoldDecay,
+        FixedReference,
+    };
+
+    enum class ToneCurveMode {
+        PowerGamma,
+        Smoothstep,
+        Sigmoid,
+        CustomCurve,
+    };
+
     explicit SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent = nullptr);
 
     // Gradient controls
@@ -27,6 +43,18 @@ public:
     float gain() const { return gain_; }
     float gamma() const { return gamma_; }
     float floor() const { return floor_; }
+    void setDisplayNormalizationMode(DisplayNormalizationMode mode) { displayNormalizationMode_ = mode; update(); }
+    DisplayNormalizationMode displayNormalizationMode() const { return displayNormalizationMode_; }
+    void setFixedDisplayReference(float amplitude) { fixedDisplayReference_ = std::max(0.01f, amplitude); update(); }
+    float fixedDisplayReference() const { return fixedDisplayReference_; }
+    void setToneCurveMode(ToneCurveMode mode) { toneCurveMode_ = mode; update(); }
+    ToneCurveMode toneCurveMode() const { return toneCurveMode_; }
+    void setCustomToneCurve(const std::vector<QPointF>& controlPoints);
+    const std::vector<QPointF>& customToneCurve() const { return customToneCurve_; }
+    QJsonArray customToneCurveJson() const;
+    void setCustomToneCurveJson(const QJsonArray& curve);
+    static const char* displayNormalizationModeName(DisplayNormalizationMode mode);
+    static const char* toneCurveModeName(ToneCurveMode mode);
     void setHardwareAccelerationEnabled(bool enabled);
     bool hardwareAccelerationEnabled() const { return hardwareAccelerationEnabled_; }
     void setDisplayedTimeSeconds(double seconds);
@@ -43,6 +71,7 @@ public:
         double peakHz = 0;
         float peakAmp = 0;
         float maxAmp = 0;
+        LoiaconoRolling::PitchResult pitch;
     };
     FrameStats frameStats() const { return frameStats_; }
 
@@ -62,14 +91,19 @@ private:
     friend class RasterCanvas;
 
     struct RGB { uint8_t r, g, b; };
+    float visualLevel(float amplitude) const;
+    float applyToneCurve(float t) const;
     RGB colormap(float amplitude) const;
     void replaceCanvas();
     void paintContent(QPainter& p, const QSize& canvasSize);
     void paintDecorations(QPainter& p, const QSize& canvasSize);
     QRect spectrogramRect(const QSize& canvasSize) const;
     QRect histogramRect(const QSize& canvasSize) const;
+    QRect frequencyAxisRect(const QSize& canvasSize) const;
+    QRect timeAxisRect(const QSize& canvasSize) const;
     int binToY(int numBins, const QRect& rect, double binIndex) const;
     void handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize);
+    void updateHoverCursor(const QPoint& position, const QSize& canvasSize);
     bool useDirectGpuPipeline() const;
 
     LoiaconoRolling* transform_;
@@ -83,6 +117,10 @@ private:
     float gain_ = 1.0f;   // pre-log multiplier
     float gamma_ = 0.6f;  // post-normalize power curve
     float floor_ = 0.05f; // below this = black (noise gate)
+    DisplayNormalizationMode displayNormalizationMode_ = DisplayNormalizationMode::SmoothedGlobalMax;
+    float fixedDisplayReference_ = 1.0f;
+    ToneCurveMode toneCurveMode_ = ToneCurveMode::PowerGamma;
+    std::vector<QPointF> customToneCurve_;
 
     float maxAmplitude_ = 1.0f;
     std::vector<float> spectrum_;
@@ -99,4 +137,9 @@ private:
     static constexpr int HISTOGRAM_WIDTH = 120; // pixels for the histogram panel
     static constexpr int AXIS_HEIGHT = 18;
     static constexpr int Y_AXIS_WIDTH = 50;   // pixels for frequency labels column
+    
+    // Pitch detection smoothing
+    std::vector<double> pitchHistory_;
+    static constexpr size_t MAX_PITCH_HISTORY = 8;
+    double smoothedPitchHz_ = 0;
 };
