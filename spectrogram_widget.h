@@ -34,6 +34,11 @@ public:
         CustomCurve,
     };
 
+    enum class ColumnFillMode {
+        DuplicateSnapshot,
+        RollingReconstruction,
+    };
+
     explicit SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent = nullptr);
 
     // Gradient controls
@@ -55,8 +60,21 @@ public:
     void setCustomToneCurveJson(const QJsonArray& curve);
     static const char* displayNormalizationModeName(DisplayNormalizationMode mode);
     static const char* toneCurveModeName(ToneCurveMode mode);
+    static const char* columnFillModeName(ColumnFillMode mode);
     void setHardwareAccelerationEnabled(bool enabled);
     bool hardwareAccelerationEnabled() const { return hardwareAccelerationEnabled_; }
+    void setColumnFillMode(ColumnFillMode mode) { columnFillMode_ = mode; update(); }
+    ColumnFillMode columnFillMode() const { return columnFillMode_; }
+    void setRollingReconstructionLimit(int limit) { rollingReconstructionLimit_ = std::max(1, limit); update(); }
+    int rollingReconstructionLimit() const { return rollingReconstructionLimit_; }
+    void setGridVisible(bool visible) { gridVisible_ = visible; update(); }
+    bool gridVisible() const { return gridVisible_; }
+    void setBufferEdgeMarkersVisible(bool visible) { bufferEdgeMarkersVisible_ = visible; update(); }
+    bool bufferEdgeMarkersVisible() const { return bufferEdgeMarkersVisible_; }
+    void setAudioBufferFrames(unsigned int frames) { audioBufferFrames_ = std::max(1u, frames); update(); }
+    unsigned int audioBufferFrames() const { return audioBufferFrames_; }
+    void setPaused(bool paused);
+    bool isPaused() const { return paused_; }
     void setDisplayedTimeSeconds(double seconds);
     double displayedTimeSeconds() const { return displaySeconds_; }
     void resetHistory();
@@ -94,6 +112,7 @@ private:
     float visualLevel(float amplitude) const;
     float applyToneCurve(float t) const;
     RGB colormap(float amplitude) const;
+    void paintSpectrumColumn(int imageX, const std::vector<float>& spectrum);
     void replaceCanvas();
     void paintContent(QPainter& p, const QSize& canvasSize);
     void paintDecorations(QPainter& p, const QSize& canvasSize);
@@ -120,6 +139,12 @@ private:
     DisplayNormalizationMode displayNormalizationMode_ = DisplayNormalizationMode::SmoothedGlobalMax;
     float fixedDisplayReference_ = 1.0f;
     ToneCurveMode toneCurveMode_ = ToneCurveMode::PowerGamma;
+    ColumnFillMode columnFillMode_ = ColumnFillMode::DuplicateSnapshot;
+    int rollingReconstructionLimit_ = 24;
+    bool gridVisible_ = true;
+    bool bufferEdgeMarkersVisible_ = false;
+    unsigned int audioBufferFrames_ = 256;
+    bool paused_ = false;
     std::vector<QPointF> customToneCurve_;
 
     float maxAmplitude_ = 1.0f;

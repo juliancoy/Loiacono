@@ -10,6 +10,7 @@
 #include <memory>
 #include <cstring>
 #include <unordered_map>
+#include <complex>
 #include "loiacono_gpu_compute.h"
 #include "loiacono_vulkan_compute.h"
 #include "loiacono_gpu_rolling_compute.h"
@@ -49,6 +50,18 @@ public:
         Energy,
     };
 
+    enum class WindowLengthMode {
+        ConstantSamples,
+        SqrtPeriod,
+        PeriodMultiple,
+    };
+
+    enum class AlgorithmMode {
+        Loiacono,
+        FFT,
+        Goertzel,
+    };
+
     LoiaconoRolling() = default;
     ~LoiaconoRolling();
 
@@ -58,6 +71,8 @@ public:
     void processSample(float sample);
     void processChunk(const float* samples, int count);
     void getSpectrum(std::vector<float>& out) const;
+    void getSpectraAtSampleCounts(const std::vector<uint64_t>& sampleCounts,
+                                  std::vector<std::vector<float>>& out) const;
 
     int numBins() const { return numBins_; }
     double binFreqHz(int i) const { return freqs_[i] * sampleRate_; }
@@ -99,6 +114,10 @@ public:
     WindowMode temporalWeightingMode() const { return windowMode(); }
     void setNormalizationMode(NormalizationMode mode) { normalizationMode_ = mode; }
     NormalizationMode normalizationMode() const { return normalizationMode_; }
+    void setWindowLengthMode(WindowLengthMode mode) { windowLengthMode_ = mode; }
+    WindowLengthMode windowLengthMode() const { return windowLengthMode_; }
+    void setAlgorithmMode(AlgorithmMode mode) { algorithmMode_ = mode; }
+    AlgorithmMode algorithmMode() const { return algorithmMode_; }
     
     // Leakiness factor: 1.0 = no leakage, 0.9999 = 0.01% leakage per sample
     void setLeakiness(double leak) { leakiness_ = std::clamp(leak, 0.99, 1.0); }
@@ -108,6 +127,8 @@ public:
     static const char* windowModeName(WindowMode mode);
     static const char* temporalWeightingModeName(WindowMode mode) { return windowModeName(mode); }
     static const char* normalizationModeName(NormalizationMode mode);
+    static const char* windowLengthModeName(WindowLengthMode mode);
+    static const char* algorithmModeName(AlgorithmMode mode);
     bool gpuComputeAvailable() const;
     bool vulkanComputeAvailable() const;
 
@@ -162,12 +183,19 @@ private:
         uint64_t sampleCount = 0;
         ComputeMode computeMode = ComputeMode::MultiThread;
         WindowMode windowMode = WindowMode::RectangularWindow;
+        AlgorithmMode algorithmMode = AlgorithmMode::Loiacono;
         double leakiness = 1.0;
     };
 
     bool ensureGpuBackendsConfiguredLocked();
     void computeSpectrumFromRingLocked(std::vector<float>& out) const;
     void computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
+    void computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
+    void computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
+    void computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
+    int fftWindowLengthForCurrentConfig() const;
+    std::vector<double> fftWindowWeights(int wlen) const;
+    void fftInPlace(std::vector<std::complex<double>>& data) const;
     double normalizationScaleForWindow(int wlen) const;
     double effectiveLeakiness() const;
     bool usesRollingState() const;
@@ -199,6 +227,8 @@ private:
     ComputeMode computeMode_ = ComputeMode::MultiThread;
     WindowMode windowMode_ = WindowMode::RectangularWindow;
     NormalizationMode normalizationMode_ = NormalizationMode::Energy;
+    WindowLengthMode windowLengthMode_ = WindowLengthMode::PeriodMultiple;
+    AlgorithmMode algorithmMode_ = AlgorithmMode::Loiacono;
     double leakiness_ = 0.99995;  // Default: 0.005% leakage per sample
     double baseAFreq_ = 440.0;    // Base A4 frequency for pitch detection
     mutable std::unique_ptr<LoiaconoGpuCompute> gpuCompute_;

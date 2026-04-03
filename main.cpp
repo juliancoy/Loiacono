@@ -2,6 +2,7 @@
 #include <QMainWindow>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QScreen>
 #include <QSlider>
 #include <QLabel>
@@ -10,6 +11,7 @@
 #include <QGroupBox>
 #include <QComboBox>
 #include <QCheckBox>
+#include <QDialog>
 #include <QSplitter>
 #include <QLockFile>
 #include <QStandardPaths>
@@ -57,9 +59,15 @@ struct SavedUiState {
     int audioFlags = 0;
     int temporalWeightingMode = static_cast<int>(LoiaconoRolling::WindowMode::RectangularWindow);
     int normalizationMode = static_cast<int>(LoiaconoRolling::NormalizationMode::Energy);
+    int windowLengthMode = static_cast<int>(LoiaconoRolling::WindowLengthMode::PeriodMultiple);
+    int algorithmMode = static_cast<int>(LoiaconoRolling::AlgorithmMode::Loiacono);
     int displayNormalizationMode = static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::SmoothedGlobalMax);
     int fixedDisplayReferenceTenths = 10;
     int toneCurveMode = static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma);
+    int columnFillMode = static_cast<int>(SpectrogramWidget::ColumnFillMode::DuplicateSnapshot);
+    int rollingReconstructionLimit = 24;
+    int gridVisible = 1;
+    int bufferEdgeMarkersVisible = 0;
     QJsonArray customToneCurve;
     QJsonArray toneCurveEditorGeometry;
 };
@@ -106,9 +114,15 @@ static SavedUiState loadSavedUiState()
     state.audioFlags = obj.value("audioFlags").toInt(state.audioFlags);
     state.temporalWeightingMode = obj.value("temporalWeightingMode").toInt(state.temporalWeightingMode);
     state.normalizationMode = obj.value("normalizationMode").toInt(state.normalizationMode);
+    state.windowLengthMode = obj.value("windowLengthMode").toInt(state.windowLengthMode);
+    state.algorithmMode = obj.value("algorithmMode").toInt(state.algorithmMode);
     state.displayNormalizationMode = obj.value("displayNormalizationMode").toInt(state.displayNormalizationMode);
     state.fixedDisplayReferenceTenths = obj.value("fixedDisplayReferenceTenths").toInt(state.fixedDisplayReferenceTenths);
     state.toneCurveMode = obj.value("toneCurveMode").toInt(state.toneCurveMode);
+    state.columnFillMode = obj.value("columnFillMode").toInt(state.columnFillMode);
+    state.rollingReconstructionLimit = obj.value("rollingReconstructionLimit").toInt(state.rollingReconstructionLimit);
+    state.gridVisible = obj.value("gridVisible").toInt(state.gridVisible);
+    state.bufferEdgeMarkersVisible = obj.value("bufferEdgeMarkersVisible").toInt(state.bufferEdgeMarkersVisible);
     if (obj.value("customToneCurve").isArray()) {
         state.customToneCurve = obj.value("customToneCurve").toArray();
     }
@@ -140,9 +154,15 @@ static void saveUiState(const SavedUiState& state)
         {"audioFlags", state.audioFlags},
         {"temporalWeightingMode", state.temporalWeightingMode},
         {"normalizationMode", state.normalizationMode},
+        {"windowLengthMode", state.windowLengthMode},
+        {"algorithmMode", state.algorithmMode},
         {"displayNormalizationMode", state.displayNormalizationMode},
         {"fixedDisplayReferenceTenths", state.fixedDisplayReferenceTenths},
         {"toneCurveMode", state.toneCurveMode},
+        {"columnFillMode", state.columnFillMode},
+        {"rollingReconstructionLimit", state.rollingReconstructionLimit},
+        {"gridVisible", state.gridVisible},
+        {"bufferEdgeMarkersVisible", state.bufferEdgeMarkersVisible},
         {"customToneCurve", state.customToneCurve},
         {"toneCurveEditorGeometry", state.toneCurveEditorGeometry},
     };
@@ -486,12 +506,22 @@ int main(int argc, char* argv[])
         std::clamp(savedState.normalizationMode,
                    static_cast<int>(LoiaconoRolling::NormalizationMode::RawSum),
                    static_cast<int>(LoiaconoRolling::NormalizationMode::Energy)));
+    auto windowLengthMode = static_cast<LoiaconoRolling::WindowLengthMode>(
+        std::clamp(savedState.windowLengthMode,
+                   static_cast<int>(LoiaconoRolling::WindowLengthMode::ConstantSamples),
+                   static_cast<int>(LoiaconoRolling::WindowLengthMode::PeriodMultiple)));
+    auto algorithmMode = static_cast<LoiaconoRolling::AlgorithmMode>(
+        std::clamp(savedState.algorithmMode,
+                   static_cast<int>(LoiaconoRolling::AlgorithmMode::Loiacono),
+                   static_cast<int>(LoiaconoRolling::AlgorithmMode::Goertzel)));
     auto toneCurveMode = static_cast<SpectrogramWidget::ToneCurveMode>(
         std::clamp(savedState.toneCurveMode,
                    static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma),
                    static_cast<int>(SpectrogramWidget::ToneCurveMode::CustomCurve)));
     transform.setWindowMode(temporalWeightingMode);
     transform.setNormalizationMode(normalizationMode);
+    transform.setWindowLengthMode(windowLengthMode);
+    transform.setAlgorithmMode(algorithmMode);
     transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
 
     auto* window = new QMainWindow;
@@ -525,51 +555,59 @@ int main(int argc, char* argv[])
     mainLayout->setContentsMargins(4, 4, 4, 0);
     mainLayout->setSpacing(4);
 
+    auto* paramsWindow = new QDialog(window);
+    paramsWindow->setWindowTitle("Loiacono Parameters");
+    paramsWindow->setModal(false);
+    paramsWindow->resize(980, 560);
+    auto* paramsLayout = new QVBoxLayout(paramsWindow);
+    paramsLayout->setContentsMargins(8, 8, 8, 8);
+    paramsLayout->setSpacing(8);
+
     // ── Settings row 1: Transform ──
     QSlider *slMultiple, *slBins, *slMin, *slMax;
     QLabel *lbMultiple, *lbBins, *lbMin, *lbMax;
 
-    auto* row1 = new QWidget;
-    row1->setMaximumHeight(40);  // Prevent row from expanding
-    auto* row1Lay = new QHBoxLayout(row1);
-    row1Lay->setContentsMargins(4, 2, 4, 2);
-    row1Lay->setSpacing(12);
-    row1Lay->addWidget(makeSlider("Multiple", slMultiple, 2, 240, multiple, " periods", lbMultiple));
-    row1Lay->addWidget(makeSlider("Bins", slBins, 32, 2400, numBins, "", lbBins));
-    row1Lay->addWidget(makeSlider("Freq min", slMin, 20, 2000, freqMin, " Hz", lbMin));
-    row1Lay->addWidget(makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax));
-    mainLayout->addWidget(row1, 0);  // 0 stretch factor - fixed size
+    auto* row1 = new QGroupBox("Transform");
+    auto* row1Lay = new QGridLayout(row1);
+    row1Lay->setContentsMargins(8, 10, 8, 8);
+    row1Lay->setHorizontalSpacing(12);
+    row1Lay->setVerticalSpacing(8);
+    auto* fieldWinScale = makeSlider("Win scale", slMultiple, 2, 240, multiple, "", lbMultiple);
+    auto* fieldBins = makeSlider("Bins", slBins, 32, 2400, numBins, "", lbBins);
+    auto* fieldFreqMin = makeSlider("Freq min", slMin, 20, 2000, freqMin, " Hz", lbMin);
+    auto* fieldFreqMax = makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax);
+    paramsLayout->addWidget(row1, 0);
 
-    // ── Settings row 2: Visual tuning ──
+    // ── Settings row 2: Display And Pitch ──
     QSlider *slGain, *slGamma, *slFloor, *slLeakiness, *slDisplaySeconds, *slBaseA, *slDisplayReference;
     QLabel *lbGain, *lbGamma, *lbFloor, *lbLeakiness, *lbDisplaySeconds, *lbBaseA, *lbDisplayReference;
 
-    auto* row2 = new QWidget;
-    row2->setMaximumHeight(40);  // Prevent row from expanding
-    auto* row2Lay = new QHBoxLayout(row2);
-    row2Lay->setContentsMargins(4, 2, 4, 2);
-    row2Lay->setSpacing(12);
-    row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, std::clamp(savedState.gainTenths, 1, 200), 10.0f, "x"));
-    row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, std::clamp(savedState.gammaHundredths, 10, 200), 100.0f, ""));
-    row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, std::clamp(savedState.floorHundredths, 0, 50), 100.0f, ""));
-    row2Lay->addWidget(makeFloatSlider("Leakiness", slLeakiness, lbLeakiness, 9900, 10000, std::clamp(savedState.leakinessHundredths, 9900, 10000), 10000.0f, ""));
+    auto* row2 = new QGroupBox("Display And Pitch");
+    auto* row2Lay = new QGridLayout(row2);
+    row2Lay->setContentsMargins(8, 10, 8, 8);
+    row2Lay->setHorizontalSpacing(12);
+    row2Lay->setVerticalSpacing(8);
+    row2Lay->addWidget(makeFloatSlider("Gain", slGain, lbGain, 1, 200, std::clamp(savedState.gainTenths, 1, 200), 10.0f, "x"), 0, 0);
+    row2Lay->addWidget(makeFloatSlider("Gamma", slGamma, lbGamma, 10, 200, std::clamp(savedState.gammaHundredths, 10, 200), 100.0f, ""), 0, 1);
+    row2Lay->addWidget(makeFloatSlider("Floor", slFloor, lbFloor, 0, 50, std::clamp(savedState.floorHundredths, 0, 50), 100.0f, ""), 1, 0);
+    row2Lay->addWidget(makeFloatSlider("Leakiness", slLeakiness, lbLeakiness, 9900, 10000, std::clamp(savedState.leakinessHundredths, 9900, 10000), 10000.0f, ""), 1, 1);
     // Fix initial label to show leakage percentage
     double initialLeakage = (10000 - slLeakiness->value()) / 100.0;
     lbLeakiness->setText(QString("Leak: %1%").arg(initialLeakage, 0, 'f', 2));
-    row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, std::clamp(savedState.displayTenths, 10, 300), 10.0f, " s"));
-    row2Lay->addWidget(makeFloatSlider("Disp ref", slDisplayReference, lbDisplayReference, 1, 1000, std::clamp(savedState.fixedDisplayReferenceTenths, 1, 1000), 10.0f, ""));
+    row2Lay->addWidget(makeFloatSlider("Displayed time", slDisplaySeconds, lbDisplaySeconds, 10, 300, std::clamp(savedState.displayTenths, 10, 300), 10.0f, " s"), 2, 0);
+    row2Lay->addWidget(makeFloatSlider("Disp ref", slDisplayReference, lbDisplayReference, 1, 1000, std::clamp(savedState.fixedDisplayReferenceTenths, 1, 1000), 10.0f, ""), 2, 1);
     // Base A frequency slider (400-500 Hz range)
     int baseAValue = std::clamp(savedState.baseAHundredths, 40000, 50000);
-    row2Lay->addWidget(makeFloatSlider("Base A", slBaseA, lbBaseA, 40000, 50000, baseAValue, 100.0f, " Hz"));
+    row2Lay->addWidget(makeFloatSlider("Base A", slBaseA, lbBaseA, 40000, 50000, baseAValue, 100.0f, " Hz"), 3, 0, 1, 2);
     transform.setBaseAFrequency(baseAValue / 100.0);
-    mainLayout->addWidget(row2, 0);  // 0 stretch factor - fixed size
+    paramsLayout->addWidget(row2, 0);
 
     // ── Settings row 3: Input + execution/display mode ──
-    auto* row3 = new QWidget;
-    row3->setMaximumHeight(60);  // Prevent row from expanding
-    auto* row3Lay = new QHBoxLayout(row3);
-    row3Lay->setContentsMargins(4, 2, 4, 2);
-    row3Lay->setSpacing(12);
+    auto* row3 = new QGroupBox("Audio");
+    auto* row3Lay = new QGridLayout(row3);
+    row3Lay->setContentsMargins(8, 10, 8, 8);
+    row3Lay->setHorizontalSpacing(12);
+    row3Lay->setVerticalSpacing(8);
 
     auto comboStyle = QString("QComboBox { font-size: 11px; min-width: 180px; }");
     auto labelStyle = QString("color: #b0c0e0; font-size: 11px;");
@@ -578,12 +616,23 @@ int main(int argc, char* argv[])
     devCombo->setStyleSheet(comboStyle);
     auto* modeCombo = new QComboBox;
     modeCombo->setStyleSheet(comboStyle);
+    auto* activeModeLabel = new QLabel;
+    activeModeLabel->setStyleSheet("color: #8fb2d9; font-size: 11px;");
+    activeModeLabel->setWordWrap(true);
     auto* temporalWeightingCombo = new QComboBox;
     temporalWeightingCombo->setStyleSheet(comboStyle);
     auto* normalizationCombo = new QComboBox;
     normalizationCombo->setStyleSheet(comboStyle);
+    auto* windowLengthCombo = new QComboBox;
+    windowLengthCombo->setStyleSheet(comboStyle);
+    auto* algorithmCombo = new QComboBox;
+    algorithmCombo->setStyleSheet(comboStyle);
     auto* toneCurveCombo = new QComboBox;
     toneCurveCombo->setStyleSheet(comboStyle);
+    auto* columnFillCombo = new QComboBox;
+    columnFillCombo->setStyleSheet(comboStyle);
+    auto* rollingReconstructionLimitCombo = new QComboBox;
+    rollingReconstructionLimitCombo->setStyleSheet(comboStyle);
     auto* displayNormalizationCombo = new QComboBox;
     displayNormalizationCombo->setStyleSheet(comboStyle);
     auto* sampleRateCombo = new QComboBox;
@@ -596,9 +645,13 @@ int main(int argc, char* argv[])
     auto* cbRealtime = new QCheckBox("Realtime");
     auto* cbExclusive = new QCheckBox("Exclusive");
     auto* cbAlsaDefault = new QCheckBox("ALSA default");
-    for (auto* cb : {cbMinLatency, cbRealtime, cbExclusive, cbAlsaDefault}) {
+    auto* cbShowGrid = new QCheckBox("Grid");
+    auto* cbBufferEdges = new QCheckBox("Buffer edges");
+    for (auto* cb : {cbMinLatency, cbRealtime, cbExclusive, cbAlsaDefault, cbShowGrid, cbBufferEdges}) {
         cb->setStyleSheet("QCheckBox { color: #b0c0e0; font-size: 11px; }");
     }
+    cbShowGrid->setChecked(savedState.gridVisible != 0);
+    cbBufferEdges->setChecked(savedState.bufferEdgeMarkersVisible != 0);
 
     const std::vector<unsigned int> sampleRates = {8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192000};
     for (unsigned int rate : sampleRates) {
@@ -650,12 +703,31 @@ int main(int argc, char* argv[])
     normalizationCombo->addItem("Energy", static_cast<int>(LoiaconoRolling::NormalizationMode::Energy));
     normalizationCombo->setCurrentIndex(
         std::max(0, normalizationCombo->findData(static_cast<int>(normalizationMode))));
+    windowLengthCombo->addItem("Constant samples", static_cast<int>(LoiaconoRolling::WindowLengthMode::ConstantSamples));
+    windowLengthCombo->addItem("Sqrt period", static_cast<int>(LoiaconoRolling::WindowLengthMode::SqrtPeriod));
+    windowLengthCombo->addItem("Period multiple", static_cast<int>(LoiaconoRolling::WindowLengthMode::PeriodMultiple));
+    windowLengthCombo->setCurrentIndex(
+        std::max(0, windowLengthCombo->findData(static_cast<int>(windowLengthMode))));
+    algorithmCombo->addItem("Loiacono", static_cast<int>(LoiaconoRolling::AlgorithmMode::Loiacono));
+    algorithmCombo->addItem("FFT", static_cast<int>(LoiaconoRolling::AlgorithmMode::FFT));
+    algorithmCombo->addItem("Goertzel", static_cast<int>(LoiaconoRolling::AlgorithmMode::Goertzel));
+    algorithmCombo->setCurrentIndex(
+        std::max(0, algorithmCombo->findData(static_cast<int>(algorithmMode))));
     toneCurveCombo->addItem("Power gamma", static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma));
     toneCurveCombo->addItem("Smoothstep", static_cast<int>(SpectrogramWidget::ToneCurveMode::Smoothstep));
     toneCurveCombo->addItem("Sigmoid", static_cast<int>(SpectrogramWidget::ToneCurveMode::Sigmoid));
     toneCurveCombo->addItem("Custom curve", static_cast<int>(SpectrogramWidget::ToneCurveMode::CustomCurve));
     toneCurveCombo->setCurrentIndex(
         std::max(0, toneCurveCombo->findData(static_cast<int>(toneCurveMode))));
+    columnFillCombo->addItem("Duplicate snapshot", static_cast<int>(SpectrogramWidget::ColumnFillMode::DuplicateSnapshot));
+    columnFillCombo->addItem("Rolling reconstruction", static_cast<int>(SpectrogramWidget::ColumnFillMode::RollingReconstruction));
+    columnFillCombo->setCurrentIndex(
+        std::max(0, columnFillCombo->findData(savedState.columnFillMode)));
+    for (int limit : {8, 12, 16, 24, 32, 48, 64}) {
+        rollingReconstructionLimitCombo->addItem(QString::number(limit), limit);
+    }
+    rollingReconstructionLimitCombo->setCurrentIndex(
+        std::max(0, rollingReconstructionLimitCombo->findData(savedState.rollingReconstructionLimit)));
     displayNormalizationCombo->addItem("Smoothed max", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::SmoothedGlobalMax));
     displayNormalizationCombo->addItem("Per-frame max", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::PerFrameMax));
     displayNormalizationCombo->addItem("Peak-hold decay", static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::PeakHoldDecay));
@@ -675,28 +747,73 @@ int main(int argc, char* argv[])
         return box;
     };
 
-    row3Lay->addWidget(addLabeledField("Input device", devCombo), 1);
-    row3Lay->addWidget(addLabeledField("Execution mode", modeCombo));
-    row3Lay->addWidget(addLabeledField("Sample rate", sampleRateCombo));
-    row3Lay->addWidget(addLabeledField("Buffer frames", bufferFramesCombo));
-    row3Lay->addWidget(addLabeledField("Buffer count", bufferCountCombo));
-    mainLayout->addWidget(row3, 0);  // 0 stretch factor - fixed size
+    row3Lay->addWidget(addLabeledField("Input device", devCombo), 0, 0, 1, 2);
+    row3Lay->addWidget(addLabeledField("Execution mode", modeCombo), 1, 0, 1, 2);
+    row3Lay->addWidget(activeModeLabel, 2, 0, 1, 2);
+    row3Lay->addWidget(addLabeledField("Sample rate", sampleRateCombo), 3, 0);
+    row3Lay->addWidget(addLabeledField("Buffer frames", bufferFramesCombo), 3, 1);
+    row3Lay->addWidget(addLabeledField("Buffer count", bufferCountCombo), 4, 0);
+    auto* audioFlags = new QWidget;
+    auto* audioFlagsLay = new QGridLayout(audioFlags);
+    audioFlagsLay->setContentsMargins(0, 0, 0, 0);
+    audioFlagsLay->setHorizontalSpacing(10);
+    audioFlagsLay->setVerticalSpacing(6);
+    audioFlagsLay->addWidget(cbMinLatency, 0, 0);
+    audioFlagsLay->addWidget(cbRealtime, 0, 1);
+    audioFlagsLay->addWidget(cbExclusive, 1, 0);
+    audioFlagsLay->addWidget(cbAlsaDefault, 1, 1);
+    row3Lay->addWidget(audioFlags, 4, 1);
+    paramsLayout->addWidget(row3, 0);
 
-    auto* row4 = new QWidget;
-    row4->setMaximumHeight(60);
-    auto* row4Lay = new QHBoxLayout(row4);
-    row4Lay->setContentsMargins(4, 2, 4, 2);
-    row4Lay->setSpacing(12);
-    row4Lay->addWidget(addLabeledField("Windowing", temporalWeightingCombo));
-    row4Lay->addWidget(addLabeledField("Normalization", normalizationCombo));
-    row4Lay->addWidget(addLabeledField("Display norm", displayNormalizationCombo));
-    row4Lay->addWidget(addLabeledField("Tone curve", toneCurveCombo));
-    row4Lay->addWidget(cbMinLatency);
-    row4Lay->addWidget(cbRealtime);
-    row4Lay->addWidget(cbExclusive);
-    row4Lay->addWidget(cbAlsaDefault);
-    row4Lay->addStretch(1);
-    mainLayout->addWidget(row4, 0);
+    auto* row4 = new QGroupBox("Display Options");
+    auto* row4Lay = new QGridLayout(row4);
+    row4Lay->setContentsMargins(8, 10, 8, 8);
+    row4Lay->setHorizontalSpacing(12);
+    row4Lay->setVerticalSpacing(8);
+    auto* fieldAlgorithm = addLabeledField("Algorithm", algorithmCombo);
+    auto* fieldWindowing = addLabeledField("Windowing", temporalWeightingCombo);
+    auto* fieldNormalization = addLabeledField("Normalization", normalizationCombo);
+    auto* fieldWindowLen = addLabeledField("Window len", windowLengthCombo);
+    auto* fieldDisplayNorm = addLabeledField("Display norm", displayNormalizationCombo);
+    auto* fieldToneCurve = addLabeledField("Tone curve", toneCurveCombo);
+    auto* fieldColumnFill = addLabeledField("Column fill", columnFillCombo);
+    auto* fieldReconLimit = addLabeledField("Recon limit", rollingReconstructionLimitCombo);
+    row1Lay->addWidget(fieldAlgorithm, 0, 0);
+    row1Lay->addWidget(fieldBins, 0, 1);
+    row1Lay->addWidget(fieldFreqMin, 1, 0);
+    row1Lay->addWidget(fieldFreqMax, 1, 1);
+    row1Lay->addWidget(fieldWinScale, 2, 0);
+    row1Lay->addWidget(fieldWindowLen, 2, 1);
+    row1Lay->addWidget(fieldWindowing, 3, 0);
+    row1Lay->addWidget(fieldNormalization, 3, 1);
+    row4Lay->addWidget(fieldDisplayNorm, 0, 0);
+    row4Lay->addWidget(fieldToneCurve, 0, 1);
+    row4Lay->addWidget(fieldColumnFill, 1, 0);
+    row4Lay->addWidget(fieldReconLimit, 1, 1);
+    auto* toggles = new QWidget;
+    auto* togglesLay = new QGridLayout(toggles);
+    togglesLay->setContentsMargins(0, 0, 0, 0);
+    togglesLay->setHorizontalSpacing(10);
+    togglesLay->setVerticalSpacing(6);
+    togglesLay->addWidget(cbShowGrid, 0, 0);
+    togglesLay->addWidget(cbBufferEdges, 0, 1);
+    row4Lay->addWidget(toggles, 2, 0, 1, 2);
+    paramsLayout->addWidget(row4, 0);
+
+    auto* topBar = new QWidget;
+    topBar->setMaximumHeight(34);
+    auto* topBarLay = new QHBoxLayout(topBar);
+    topBarLay->setContentsMargins(4, 2, 4, 2);
+    topBarLay->setSpacing(8);
+    auto* pauseButton = new QPushButton("Pause");
+    pauseButton->setCheckable(true);
+    pauseButton->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 10px; }");
+    auto* paramsButton = new QPushButton("Parameters...");
+    paramsButton->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 10px; }");
+    topBarLay->addWidget(pauseButton);
+    topBarLay->addWidget(paramsButton);
+    topBarLay->addStretch(1);
+    mainLayout->addWidget(topBar, 0);
 
     // ── Spectrogram ──
     auto* spectrogram = new SpectrogramWidget(&transform);
@@ -707,6 +824,12 @@ int main(int argc, char* argv[])
         displayNormalizationCombo->currentData().toInt()));
     spectrogram->setFixedDisplayReference(slDisplayReference->value() / 10.0f);
     spectrogram->setToneCurveMode(toneCurveMode);
+    spectrogram->setColumnFillMode(static_cast<SpectrogramWidget::ColumnFillMode>(
+        columnFillCombo->currentData().toInt()));
+    spectrogram->setRollingReconstructionLimit(rollingReconstructionLimitCombo->currentData().toInt());
+    spectrogram->setGridVisible(cbShowGrid->isChecked());
+    spectrogram->setBufferEdgeMarkersVisible(cbBufferEdges->isChecked());
+    spectrogram->setAudioBufferFrames(audioSettings.bufferFrames);
     spectrogram->setCustomToneCurveJson(savedState.customToneCurve);
     transform.setLeakiness(slLeakiness->value() / 10000.0);
     spectrogram->setDisplayedTimeSeconds(slDisplaySeconds->value() / 10.0);
@@ -717,11 +840,23 @@ int main(int argc, char* argv[])
     toneCurveEditor->setGeometry(rectFromJson(savedState.toneCurveEditorGeometry, toneCurveEditor->geometry()));
     auto* toneCurveButton = new QPushButton("Curves...");
     toneCurveButton->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 8px; }");
-    row4Lay->addWidget(toneCurveButton);
+    row4Lay->addWidget(toneCurveButton, 3, 0, 1, 2, Qt::AlignLeft);
+    paramsLayout->addStretch(1);
 
     window->setCentralWidget(central);
     auto* statusBar = window->statusBar();
     statusBar->setStyleSheet("font-size: 11px; color: #607090;");
+
+    QObject::connect(pauseButton, &QPushButton::toggled, [spectrogram, pauseButton, statusBar](bool paused) {
+        spectrogram->setPaused(paused);
+        pauseButton->setText(paused ? "Resume" : "Pause");
+        statusBar->showMessage(paused ? "Display paused" : "Display resumed");
+    });
+    QObject::connect(paramsButton, &QPushButton::clicked, [paramsWindow]() {
+        paramsWindow->show();
+        paramsWindow->raise();
+        paramsWindow->activateWindow();
+    });
 
     auto updateLeakinessLabel = [&]() {
         double leakagePercent = (10000 - slLeakiness->value()) / 100.0;
@@ -748,6 +883,39 @@ int main(int argc, char* argv[])
         lbGamma->setEnabled(gammaDriven);
         toneCurveButton->setEnabled(true);
         toneCurveButton->setText(mode == SpectrogramWidget::ToneCurveMode::CustomCurve ? "Edit curve..." : "Curves...");
+    };
+
+    auto updateColumnFillUi = [&]() {
+        bool rollingMode = static_cast<SpectrogramWidget::ColumnFillMode>(
+            columnFillCombo->currentData().toInt()) == SpectrogramWidget::ColumnFillMode::RollingReconstruction;
+        rollingReconstructionLimitCombo->setEnabled(rollingMode);
+    };
+    updateColumnFillUi();
+
+    auto updateTransformUi = [&]() {
+        auto mode = static_cast<LoiaconoRolling::AlgorithmMode>(algorithmCombo->currentData().toInt());
+        row1->setTitle(QString("Transform: %1").arg(QString::fromLatin1(LoiaconoRolling::algorithmModeName(mode)).toUpper()));
+        QString scaleName = mode == LoiaconoRolling::AlgorithmMode::FFT ? "FFT scale" : "Win scale";
+        lbMultiple->setText(QString("%1: %2").arg(scaleName).arg(slMultiple->value()));
+    };
+    updateTransformUi();
+
+    auto updateActiveModeUi = [&]() {
+        const int packed = modeCombo->currentData().toInt();
+        const auto requestedCompute = static_cast<LoiaconoRolling::ComputeMode>(packed >> 1);
+        const bool requestedGpuDisplay = (packed & 1) != 0;
+        const auto actualCompute = transform.activeComputeMode();
+        const QString displayText = spectrogram->hardwareAccelerationEnabled() ? "gpu-display" : "cpu-display";
+        QString text = QString("Active path: %1 + %2")
+            .arg(LoiaconoRolling::computeModeName(actualCompute))
+            .arg(displayText);
+        if (requestedCompute != actualCompute) {
+            text += QString("  |  requested %1").arg(LoiaconoRolling::computeModeName(requestedCompute));
+        }
+        if (requestedGpuDisplay != spectrogram->hardwareAccelerationEnabled()) {
+            text += QString("  |  requested %1-display").arg(requestedGpuDisplay ? "gpu" : "cpu");
+        }
+        activeModeLabel->setText(text);
     };
 
     auto saveStateNow = [&]() {
@@ -779,9 +947,15 @@ int main(int argc, char* argv[])
         current.audioFlags = static_cast<int>(audioSettings.flags);
         current.temporalWeightingMode = temporalWeightingCombo->currentData().toInt();
         current.normalizationMode = normalizationCombo->currentData().toInt();
+        current.windowLengthMode = windowLengthCombo->currentData().toInt();
+        current.algorithmMode = algorithmCombo->currentData().toInt();
         current.displayNormalizationMode = displayNormalizationCombo->currentData().toInt();
         current.fixedDisplayReferenceTenths = slDisplayReference->value();
         current.toneCurveMode = toneCurveCombo->currentData().toInt();
+        current.columnFillMode = columnFillCombo->currentData().toInt();
+        current.rollingReconstructionLimit = rollingReconstructionLimitCombo->currentData().toInt();
+        current.gridVisible = cbShowGrid->isChecked() ? 1 : 0;
+        current.bufferEdgeMarkersVisible = cbBufferEdges->isChecked() ? 1 : 0;
         current.customToneCurve = spectrogram->customToneCurveJson();
         current.toneCurveEditorGeometry = rectToJson(toneCurveEditor->geometry());
         saveUiState(current);
@@ -798,16 +972,25 @@ int main(int argc, char* argv[])
             temporalWeightingCombo->currentData().toInt()));
         transform.setNormalizationMode(static_cast<LoiaconoRolling::NormalizationMode>(
             normalizationCombo->currentData().toInt()));
+        transform.setWindowLengthMode(static_cast<LoiaconoRolling::WindowLengthMode>(
+            windowLengthCombo->currentData().toInt()));
+        transform.setAlgorithmMode(static_cast<LoiaconoRolling::AlgorithmMode>(
+            algorithmCombo->currentData().toInt()));
         transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
+        spectrogram->setAudioBufferFrames(audioSettings.bufferFrames);
         spectrogram->setDisplayNormalizationMode(static_cast<SpectrogramWidget::DisplayNormalizationMode>(
             displayNormalizationCombo->currentData().toInt()));
         spectrogram->setFixedDisplayReference(slDisplayReference->value() / 10.0f);
         spectrogram->setToneCurveMode(static_cast<SpectrogramWidget::ToneCurveMode>(
             toneCurveCombo->currentData().toInt()));
+        spectrogram->setColumnFillMode(static_cast<SpectrogramWidget::ColumnFillMode>(
+            columnFillCombo->currentData().toInt()));
+        spectrogram->setRollingReconstructionLimit(rollingReconstructionLimitCombo->currentData().toInt());
         spectrogram->resetHistory();
         saveStateNow();
     };
     QObject::connect(slMultiple, &QSlider::valueChanged, reconfigure);
+    QObject::connect(slMultiple, &QSlider::valueChanged, [&](int) { updateTransformUi(); });
     QObject::connect(slBins, &QSlider::valueChanged, reconfigure);
     QObject::connect(slMin, &QSlider::valueChanged, reconfigure);
     QObject::connect(slMax, &QSlider::valueChanged, reconfigure);
@@ -854,7 +1037,7 @@ int main(int argc, char* argv[])
         slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
     });
 
-    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo, saveStateNow](int index) {
+    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo, saveStateNow, updateActiveModeUi](int index) {
         int packed = modeCombo->itemData(index).toInt();
         auto mode = static_cast<LoiaconoRolling::ComputeMode>(packed >> 1);
         bool gpuDisplay = (packed & 1) != 0;
@@ -868,10 +1051,12 @@ int main(int argc, char* argv[])
             message += " | Vulkan compute unavailable, using multi-thread CPU";
         }
         statusBar->showMessage(message);
+        updateActiveModeUi();
         saveStateNow();
     });
     // Explicitly trigger the signal to set initial mode
     emit modeCombo->currentIndexChanged(modeCombo->currentIndex());
+    updateActiveModeUi();
 
     // ── Audio ──
     std::unique_ptr<RtAudio> adc;
@@ -911,7 +1096,12 @@ int main(int argc, char* argv[])
             temporalWeightingCombo->currentData().toInt()));
         transform.setNormalizationMode(static_cast<LoiaconoRolling::NormalizationMode>(
             normalizationCombo->currentData().toInt()));
+        transform.setWindowLengthMode(static_cast<LoiaconoRolling::WindowLengthMode>(
+            windowLengthCombo->currentData().toInt()));
+        transform.setAlgorithmMode(static_cast<LoiaconoRolling::AlgorithmMode>(
+            algorithmCombo->currentData().toInt()));
         transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
+        spectrogram->setAudioBufferFrames(audioSettings.bufferFrames);
         spectrogram->resetHistory();
         if (devCombo->currentIndex() >= 0) {
             RtAudio::Api api = RtAudio::UNSPECIFIED;
@@ -922,6 +1112,7 @@ int main(int argc, char* argv[])
             }
         }
         updateLeakinessLabel();
+        updateActiveModeUi();
         saveStateNow();
     };
 
@@ -947,11 +1138,44 @@ int main(int argc, char* argv[])
         reconfigure();
         saveStateNow();
     });
+    QObject::connect(windowLengthCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        reconfigure();
+        saveStateNow();
+    });
+    QObject::connect(algorithmCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        updateTransformUi();
+        reconfigure();
+        emit modeCombo->currentIndexChanged(modeCombo->currentIndex());
+        updateActiveModeUi();
+        saveStateNow();
+    });
     QObject::connect(toneCurveCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
         spectrogram->setToneCurveMode(static_cast<SpectrogramWidget::ToneCurveMode>(
             toneCurveCombo->currentData().toInt()));
         updateToneCurveUi();
         spectrogram->resetHistory();
+        saveStateNow();
+    });
+    QObject::connect(columnFillCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        spectrogram->setColumnFillMode(static_cast<SpectrogramWidget::ColumnFillMode>(
+            columnFillCombo->currentData().toInt()));
+        updateColumnFillUi();
+        spectrogram->resetHistory();
+        saveStateNow();
+    });
+    QObject::connect(rollingReconstructionLimitCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
+        spectrogram->setRollingReconstructionLimit(rollingReconstructionLimitCombo->currentData().toInt());
+        if (spectrogram->columnFillMode() == SpectrogramWidget::ColumnFillMode::RollingReconstruction) {
+            spectrogram->resetHistory();
+        }
+        saveStateNow();
+    });
+    QObject::connect(cbShowGrid, &QCheckBox::toggled, [&](bool checked) {
+        spectrogram->setGridVisible(checked);
+        saveStateNow();
+    });
+    QObject::connect(cbBufferEdges, &QCheckBox::toggled, [&](bool checked) {
+        spectrogram->setBufferEdgeMarkersVisible(checked);
         saveStateNow();
     });
     QObject::connect(displayNormalizationCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int) {
@@ -1052,6 +1276,8 @@ int main(int argc, char* argv[])
 
     saveStateNow();
     window->show();
+    paramsWindow->move(window->frameGeometry().right() + 12, window->frameGeometry().top());
+    paramsWindow->show();
     int ret = app.exec();
     saveStateNow();
     if (adc && adc->isStreamOpen()) adc->closeStream();

@@ -79,6 +79,16 @@ SpectrogramWidget::SpectrogramWidget(LoiaconoRolling* transform, QWidget* parent
     timer_.start(0);
 }
 
+void SpectrogramWidget::setPaused(bool paused)
+{
+    if (paused_ == paused) return;
+    paused_ = paused;
+    lastColumnSampleCount_ = transform_->getStats().totalSamples;
+    pendingColumnFraction_ = 0.0;
+    pendingGpuColumns_ = 0;
+    update();
+}
+
 const char* SpectrogramWidget::displayNormalizationModeName(DisplayNormalizationMode mode)
 {
     switch (mode) {
@@ -105,6 +115,17 @@ const char* SpectrogramWidget::toneCurveModeName(ToneCurveMode mode)
         return "sigmoid";
     case ToneCurveMode::CustomCurve:
         return "custom";
+    }
+    return "unknown";
+}
+
+const char* SpectrogramWidget::columnFillModeName(ColumnFillMode mode)
+{
+    switch (mode) {
+    case ColumnFillMode::DuplicateSnapshot:
+        return "duplicate";
+    case ColumnFillMode::RollingReconstruction:
+        return "rolling";
     }
     return "unknown";
 }
@@ -289,12 +310,29 @@ int SpectrogramWidget::binToY(int numBins, const QRect& rect, double binIndex) c
 bool SpectrogramWidget::useDirectGpuPipeline() const
 {
     if (!hardwareAccelerationEnabled_) return false;
+    if (transform_->algorithmMode() != LoiaconoRolling::AlgorithmMode::Loiacono) return false;
+    if (columnFillMode_ != ColumnFillMode::DuplicateSnapshot) return false;
     if (transform_->activeComputeMode() != LoiaconoRolling::ComputeMode::GpuCompute) return false;
     if (displayNormalizationMode_ != DisplayNormalizationMode::SmoothedGlobalMax) return false;
     if (toneCurveMode_ != ToneCurveMode::PowerGamma) return false;
     auto windowMode = transform_->windowMode();
     return windowMode == LoiaconoRolling::WindowMode::RectangularWindow
         || windowMode == LoiaconoRolling::WindowMode::LeakyWindow;
+}
+
+void SpectrogramWidget::paintSpectrumColumn(int imageX, const std::vector<float>& spectrum)
+{
+    int nb = transform_->numBins();
+    int h = image_.height();
+    if (imageX < 0 || imageX >= image_.width() || h <= 0 || nb <= 0 || spectrum.empty()) return;
+
+    for (int row = 0; row < h; ++row) {
+        double binF = (nb - 1) * (h - 1 - row) / std::max(1, h - 1);
+        int fi = static_cast<int>(std::clamp(std::floor(binF), 0.0, static_cast<double>(nb - 1)));
+        auto [r, g, b] = colormap(spectrum[fi]);
+        auto* line = reinterpret_cast<QRgb*>(image_.scanLine(row));
+        line[imageX] = qRgb(r, g, b);
+    }
 }
 
 void SpectrogramWidget::handleWheelZoom(const QPoint& position, int angleDeltaY, const QSize& canvasSize)
@@ -380,6 +418,8 @@ void SpectrogramWidget::updateHoverCursor(const QPoint& position, const QSize& c
 
 void SpectrogramWidget::tick()
 {
+    if (paused_) return;
+
     int nb = transform_->numBins();
     if (nb < 1 || !canvas_) return;
 
@@ -445,6 +485,7 @@ void SpectrogramWidget::tick()
     if (lastColumnSampleCount_ == 0) {
         lastColumnSampleCount_ = runtimeStats.totalSamples;
     }
+    const uint64_t previousColumnSampleCount = lastColumnSampleCount_;
     uint64_t newSamples = runtimeStats.totalSamples >= lastColumnSampleCount_
         ? (runtimeStats.totalSamples - lastColumnSampleCount_)
         : 0;
@@ -468,15 +509,37 @@ void SpectrogramWidget::tick()
     }
 
     if (columnsToAdvance > 0 && !useDirectGpuPipeline()) {
-        // Map frequency bins to image rows, stretching to fill full height
-        for (int row = 0; row < h; row++) {
-            // Map row to bin index (inverted: row 0 is top = highest frequency)
-            double binF = (nb - 1) * (h - 1 - row) / std::max(1, h - 1);
-            int fi = static_cast<int>(std::clamp(std::floor(binF), 0.0, static_cast<double>(nb - 1)));
-            auto [r, g, b] = colormap(spectrum_[fi]);
-            auto* line = reinterpret_cast<QRgb*>(image_.scanLine(row));
-            for (int x = w - columnsToAdvance; x < w; x++) {
-                line[x] = qRgb(r, g, b);
+        if (columnFillMode_ == ColumnFillMode::RollingReconstruction
+            && newSamples > 0
+            && previousColumnSampleCount > 0) {
+            const int reconstructedColumns = std::min(columnsToAdvance, rollingReconstructionLimit_);
+            std::vector<uint64_t> sampleCounts;
+            sampleCounts.reserve(static_cast<size_t>(reconstructedColumns));
+            for (int i = 0; i < reconstructedColumns; ++i) {
+                const double t = static_cast<double>(i + 1) / static_cast<double>(reconstructedColumns);
+                const uint64_t offset = static_cast<uint64_t>(std::llround(t * static_cast<double>(newSamples)));
+                sampleCounts.push_back(std::min(runtimeStats.totalSamples, previousColumnSampleCount + offset));
+            }
+            std::vector<std::vector<float>> spectra;
+            transform_->getSpectraAtSampleCounts(sampleCounts, spectra);
+            if (spectra.size() == sampleCounts.size()) {
+                for (int i = 0; i < columnsToAdvance; ++i) {
+                    int spectrumIx = 0;
+                    if (columnsToAdvance > 1 && reconstructedColumns > 1) {
+                        const double t = static_cast<double>(i) / static_cast<double>(columnsToAdvance - 1);
+                        spectrumIx = static_cast<int>(std::lround(t * static_cast<double>(reconstructedColumns - 1)));
+                    }
+                    spectrumIx = std::clamp(spectrumIx, 0, reconstructedColumns - 1);
+                    paintSpectrumColumn(w - columnsToAdvance + i, spectra[static_cast<size_t>(spectrumIx)]);
+                }
+            } else {
+                for (int x = w - columnsToAdvance; x < w; ++x) {
+                    paintSpectrumColumn(x, spectrum_);
+                }
+            }
+        } else {
+            for (int x = w - columnsToAdvance; x < w; ++x) {
+                paintSpectrumColumn(x, spectrum_);
             }
         }
     }
@@ -646,9 +709,11 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
         QString label = f >= 1000 ? QString("%1k").arg(f / 1000.0, 0, 'f', 1)
                                   : QString::number(static_cast<int>(f));
         
-        // Draw horizontal grid line across spectrogram only
-        p.setPen(QColor(40, 40, 60));
-        p.drawLine(spectRect.left(), y, spectRect.right(), y);
+        if (gridVisible_) {
+            // Draw horizontal grid line across spectrogram only
+            p.setPen(QColor(40, 40, 60));
+            p.drawLine(spectRect.left(), y, spectRect.right(), y);
+        }
         
         // Draw tick mark on the separator line
         p.setPen(QColor(100, 100, 130));
@@ -675,10 +740,12 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     lines << QString("FPS: %1").arg(frameStats_.fps, 0, 'f', 0);
     lines << QString("Displayed: %1 s").arg(displaySeconds_, 0, 'f', 1);
     lines << QString("Render: %1").arg(hardwareAccelerationEnabled_ ? "GPU" : "CPU");
+    lines << QString("Alg: %1").arg(LoiaconoRolling::algorithmModeName(transform_->algorithmMode()));
     lines << QString("Norm: %1").arg(displayNormalizationModeName(displayNormalizationMode_));
     lines << QString("CPU thr: %1").arg(transform_->cpuThreads());
     lines << QString("Compute: %1").arg(LoiaconoRolling::computeModeName(transform_->activeComputeMode()));
-    lines << QString("Bins: %1 x%2").arg(stats.currentBins).arg(stats.currentMultiple);
+    lines << QString("Bins: %1 scale:%2").arg(stats.currentBins).arg(stats.currentMultiple);
+    lines << QString("Wlen: %1").arg(LoiaconoRolling::windowLengthModeName(transform_->windowLengthMode()));
     lines << QString("CPU: %1%").arg(stats.cpuLoadPercent, 0, 'f', 1);
     lines << QString("%1 kS/s").arg(stats.samplesPerSecond / 1000.0, 0, 'f', 1);
     if (!directGpu) {
@@ -762,12 +829,34 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
         double ageSeconds = static_cast<double>(second);
         int x = spectRect.width() - 1 - static_cast<int>((ageSeconds / displaySeconds_) * (spectRect.width() - 1));
         x = std::clamp(x, spectRect.left(), spectRect.right());
-        p.setPen(QColor(40, 40, 60));
-        p.drawLine(x, spectRect.top(), x, spectRect.bottom());
-        p.drawLine(x, axisY, x, axisY + 4);
+        if (gridVisible_) {
+            p.setPen(QColor(40, 40, 60));
+            p.drawLine(x, spectRect.top(), x, spectRect.bottom());
+        }
         p.setPen(QColor(120, 120, 150));
+        p.drawLine(x, axisY, x, axisY + 4);
         QString label = second == 0 ? "0" : QString("-%1").arg(second);
         p.drawText(std::max(0, x - 8), axisY + 14, label);
+    }
+
+    if (bufferEdgeMarkersVisible_ && audioBufferFrames_ > 0) {
+        const uint64_t totalSamples = stats.totalSamples;
+        const double displaySamples = displaySeconds_ * transform_->sampleRate();
+        const uint64_t maxVisibleAgeSamples = static_cast<uint64_t>(std::ceil(std::max(1.0, displaySamples)));
+        const uint64_t firstVisibleSample = totalSamples > maxVisibleAgeSamples
+            ? (totalSamples - maxVisibleAgeSamples)
+            : 0;
+        uint64_t firstBoundary = ((firstVisibleSample + audioBufferFrames_ - 1) / audioBufferFrames_) * audioBufferFrames_;
+        p.setPen(QColor(255, 180, 70, 140));
+        for (uint64_t boundary = firstBoundary; boundary <= totalSamples; boundary += audioBufferFrames_) {
+            const uint64_t ageSamples = totalSamples - boundary;
+            if (static_cast<double>(ageSamples) > displaySamples) continue;
+            int x = spectRect.right() - static_cast<int>(
+                std::lround((static_cast<double>(ageSamples) / std::max(1.0, displaySamples)) * (spectRect.width() - 1)));
+            x = std::clamp(x, spectRect.left(), spectRect.right());
+            p.drawLine(x, spectRect.top(), x, spectRect.bottom());
+            p.drawLine(x, axisY, x, axisY + 6);
+        }
     }
 }
 

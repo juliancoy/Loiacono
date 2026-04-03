@@ -1,0 +1,76 @@
+#version 450
+
+DEFINE_STRING
+BUFFERS_STRING
+LEAKINESS_DECL
+
+layout(local_size_x = THREADS_PER_WORKGROUP, local_size_y = 1, local_size_z = 1) in;
+
+float windowWeight(int mode, int index, int len)
+{
+    if (len <= 1) return 1.0;
+    float phase = 2.0 * PI * float(index) / float(len - 1);
+    if (mode == 1) return 0.5 - 0.5 * cos(phase);
+    if (mode == 2) return 0.54 - 0.46 * cos(phase);
+    if (mode == 3) return 0.42 - 0.5 * cos(phase) + 0.08 * cos(2.0 * phase);
+    if (mode == 4) return 0.35875 - 0.48829 * cos(phase) + 0.14128 * cos(2.0 * phase) - 0.01168 * cos(3.0 * phase);
+    return 1.0;
+}
+
+float normalizationScale(int mode, float weightSum, float weightEnergy)
+{
+    if (mode == 1) return weightSum > 0.0 ? 1.0 / weightSum : 1.0;
+    if (mode == 2) return weightEnergy > 0.0 ? inversesqrt(weightEnergy) : 1.0;
+    return 1.0;
+}
+
+void main()
+{
+    uint frequencyIx = gl_WorkGroupID.x;
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+
+    int fftLen = int(max(params[2], 2u));
+    int validSamples = min(fftLen, int(min(params[1], uint(SIGNAL_LENGTH))));
+    if (validSamples <= 0) {
+        L[frequencyIx] = 0.0;
+        return;
+    }
+
+    uint ringStart = (params[0] + uint(SIGNAL_LENGTH - validSamples)) % uint(SIGNAL_LENGTH);
+    int windowMode = int(params[3]);
+    int normalizationMode = int(params[4]);
+    float targetIndex = clamp(f[frequencyIx] * float(fftLen), 0.0, float(fftLen / 2));
+    int i0 = int(floor(targetIndex));
+    int i1 = min(fftLen / 2, i0 + 1);
+    float frac = targetIndex - float(i0);
+
+    float real0 = 0.0;
+    float imag0 = 0.0;
+    float real1 = 0.0;
+    float imag1 = 0.0;
+    float weightSum = 0.0;
+    float weightEnergy = 0.0;
+
+    for (int k = 0; k < validSamples; ++k) {
+        uint readIx = (ringStart + uint(k)) % uint(SIGNAL_LENGTH);
+        float weight = windowMode == 5
+            ? pow(LEAKINESS_VALUE, float(validSamples - 1 - k))
+            : windowWeight(windowMode, k, validSamples);
+        float sampleValue = x[readIx] * weight;
+        float angle0 = -2.0 * PI * float(i0 * k) / float(fftLen);
+        float angle1 = -2.0 * PI * float(i1 * k) / float(fftLen);
+        real0 += sampleValue * cos(angle0);
+        imag0 += sampleValue * sin(angle0);
+        real1 += sampleValue * cos(angle1);
+        imag1 += sampleValue * sin(angle1);
+        weightSum += weight;
+        weightEnergy += weight * weight;
+    }
+
+    float normScale = normalizationScale(normalizationMode, weightSum, weightEnergy);
+    float mag0 = sqrt(real0 * real0 + imag0 * imag0) * normScale;
+    float mag1 = sqrt(real1 * real1 + imag1 * imag1) * normScale;
+    L[frequencyIx] = mix(mag0, mag1, frac);
+}

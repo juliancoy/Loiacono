@@ -8,6 +8,7 @@
 #include <QOpenGLExtraFunctions>
 #include <QSurfaceFormat>
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -15,21 +16,35 @@
 namespace {
 constexpr int THREADS_PER_WORKGROUP = 128;
 
-QString loadShaderTemplate()
+QString shaderTemplateName(int algorithmMode)
 {
-    const QString path = QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../../shaders/loiacono_generic.comp.template");
+    switch (algorithmMode) {
+    case 1:
+        return QStringLiteral("fft_generic.comp.template");
+    case 2:
+        return QStringLiteral("goertzel_generic.comp.template");
+    case 0:
+    default:
+        return QStringLiteral("loiacono_generic.comp.template");
+    }
+}
+
+QString loadShaderTemplate(int algorithmMode)
+{
+    const QString path = QDir(QCoreApplication::applicationDirPath())
+        .absoluteFilePath(QStringLiteral("../../shaders/%1").arg(shaderTemplateName(algorithmMode)));
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
     return QString::fromUtf8(file.readAll());
 }
 
-QString buildShaderSource(int signalLength)
+QString buildShaderSource(int signalLength, int algorithmMode)
 {
-    QString source = loadShaderTemplate();
+    QString source = loadShaderTemplate(algorithmMode);
     if (source.isEmpty()) return {};
 
     const QString defines = QString(
-        "#define PI 3.1415926\n"
+        "#define PI 3.14159265358979323846\n"
         "#define SIGNAL_LENGTH %1\n"
         "#define THREADS_PER_WORKGROUP %2\n")
         .arg(signalLength)
@@ -41,10 +56,12 @@ QString buildShaderSource(int signalLength)
         "layout(std430, binding = 2) buffer f_buf { readonly float f[]; };\n"
         "layout(std430, binding = 3) buffer norm_buf { readonly float norm[]; };\n"
         "layout(std430, binding = 4) buffer window_buf { readonly int windowLen[]; };\n"
-        "layout(std430, binding = 5) buffer offset_buf { readonly uint offset[16]; };\n";
+        "layout(std430, binding = 5) buffer params_buf { readonly uint params[16]; };\n";
 
     source.replace("DEFINE_STRING", defines);
     source.replace("BUFFERS_STRING", buffers);
+    source.replace("LEAKINESS_DECL", "uniform float leakiness;\n");
+    source.replace("LEAKINESS_VALUE", "leakiness");
     return source;
 }
 }
@@ -73,21 +90,29 @@ public:
                    int numBins,
                    const std::vector<double>& freqs,
                    const std::vector<double>& norms,
-                   const std::vector<int>& windowLens)
+                   const std::vector<int>& windowLens,
+                   int algorithmMode,
+                   int windowMode,
+                   int normalizationMode,
+                   int fftLength)
     {
         if (!ensureContext()) return false;
         if (!context_->makeCurrent(surface_.get())) return false;
         auto* f = context_->extraFunctions();
 
-        if (signalLength_ != signalLength || program_ == 0) {
+        const bool needsProgramRebuild = signalLength_ != signalLength
+            || algorithmMode_ != algorithmMode
+            || program_ == 0;
+        if (needsProgramRebuild) {
             if (program_) {
                 f->glDeleteProgram(program_);
                 program_ = 0;
             }
 
-            QString source = buildShaderSource(signalLength);
+            const QString source = buildShaderSource(signalLength, algorithmMode);
             if (source.isEmpty()) {
                 context_->doneCurrent();
+                initialized_ = false;
                 return false;
             }
 
@@ -102,6 +127,7 @@ public:
             if (!ok) {
                 f->glDeleteShader(shader);
                 context_->doneCurrent();
+                initialized_ = false;
                 return false;
             }
 
@@ -115,10 +141,12 @@ public:
                 f->glDeleteProgram(program_);
                 program_ = 0;
                 context_->doneCurrent();
+                initialized_ = false;
                 return false;
             }
 
             signalLength_ = signalLength;
+            algorithmMode_ = algorithmMode;
         }
 
         if (!buffersInitialized_) {
@@ -129,8 +157,8 @@ public:
         std::vector<float> freqFloats(numBins);
         std::vector<float> normFloats(numBins);
         for (int i = 0; i < numBins; ++i) {
-            freqFloats[i] = static_cast<float>(freqs[i]);
-            normFloats[i] = static_cast<float>(norms[i]);
+            freqFloats[static_cast<size_t>(i)] = static_cast<float>(freqs[static_cast<size_t>(i)]);
+            normFloats[static_cast<size_t>(i)] = static_cast<float>(norms[static_cast<size_t>(i)]);
         }
 
         bindBufferData(f, buffers_[0], signalLength * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
@@ -139,10 +167,17 @@ public:
         bindBufferData(f, buffers_[2], std::max(1, numBins) * static_cast<int>(sizeof(float)), freqFloats.data(), GL_DYNAMIC_DRAW);
         bindBufferData(f, buffers_[3], std::max(1, numBins) * static_cast<int>(sizeof(float)), normFloats.data(), GL_DYNAMIC_DRAW);
         bindBufferData(f, buffers_[4], std::max(1, numBins) * static_cast<int>(sizeof(int)), windowLens.data(), GL_DYNAMIC_DRAW);
-        unsigned int zeroOffset[16] = {};
-        bindBufferData(f, buffers_[5], sizeof(zeroOffset), zeroOffset, GL_DYNAMIC_DRAW);
+
+        unsigned int params[16] = {};
+        params[2] = static_cast<unsigned int>(std::max(2, fftLength));
+        params[3] = static_cast<unsigned int>(std::max(0, windowMode));
+        params[4] = static_cast<unsigned int>(std::max(0, normalizationMode));
+        bindBufferData(f, buffers_[5], sizeof(params), params, GL_DYNAMIC_DRAW);
 
         numBins_ = numBins;
+        windowMode_ = windowMode;
+        normalizationMode_ = normalizationMode;
+        fftLength_ = fftLength;
         cachedSpectrum_.assign(numBins_, 0.0f);
         hasCachedSpectrum_ = false;
         activeOutputBufferIndex_ = 0;
@@ -157,14 +192,14 @@ public:
         return true;
     }
 
-    bool compute(const std::vector<float>& ring, unsigned int offset, std::vector<float>& outSpectrum)
-    {
-        return compute(ring, offset, 1.0f, outSpectrum);
-    }
-
-    bool compute(const std::vector<float>& ring, unsigned int offset, float leakiness, std::vector<float>& outSpectrum)
+    bool compute(const std::vector<float>& ring,
+                 unsigned int offset,
+                 unsigned int availableSamples,
+                 float leakiness,
+                 std::vector<float>& outSpectrum)
     {
         if (!initialized_ || !ensureContext() || numBins_ <= 0) return false;
+        if (ring.size() != static_cast<size_t>(signalLength_)) return false;
         if (!context_->makeCurrent(surface_.get())) return false;
         auto* f = context_->extraFunctions();
 
@@ -184,13 +219,17 @@ public:
         f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, buffers_[3]);
         f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, buffers_[4]);
 
-        unsigned int offsets[16] = {};
-        offsets[0] = offset;
+        unsigned int params[16] = {};
+        params[0] = offset;
+        params[1] = std::min<unsigned int>(availableSamples, static_cast<unsigned int>(signalLength_));
+        params[2] = static_cast<unsigned int>(std::max(2, fftLength_));
+        params[3] = static_cast<unsigned int>(std::max(0, windowMode_));
+        params[4] = static_cast<unsigned int>(std::max(0, normalizationMode_));
         f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[5]);
-        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(offsets), offsets);
+        f->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(params), params);
         f->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, buffers_[5]);
 
-        GLint leakLoc = f->glGetUniformLocation(program_, "leakiness");
+        const GLint leakLoc = f->glGetUniformLocation(program_, "leakiness");
         if (leakLoc >= 0) {
             f->glUniform1f(leakLoc, leakiness);
         }
@@ -205,20 +244,19 @@ public:
         outputFences_[writeIndex] = f->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         activeOutputBufferIndex_ = readIndex;
 
-        bool updatedCache = false;
         if (outputFences_[readIndex]) {
-            GLenum waitResult = f->glClientWaitSync(outputFences_[readIndex], 0, 0);
+            const GLenum waitResult = f->glClientWaitSync(outputFences_[readIndex], 0, 0);
             if (waitResult == GL_ALREADY_SIGNALED || waitResult == GL_CONDITION_SATISFIED) {
                 f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, readBuffer);
-                void* mapped = f->glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0,
+                void* mapped = f->glMapBufferRange(GL_SHADER_STORAGE_BUFFER,
+                                                   0,
                                                    numBins_ * static_cast<int>(sizeof(float)),
                                                    GL_MAP_READ_BIT);
                 if (mapped) {
-                    cachedSpectrum_.resize(numBins_);
-                    std::memcpy(cachedSpectrum_.data(), mapped, numBins_ * sizeof(float));
+                    cachedSpectrum_.resize(static_cast<size_t>(numBins_));
+                    std::memcpy(cachedSpectrum_.data(), mapped, static_cast<size_t>(numBins_) * sizeof(float));
                     f->glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
                     hasCachedSpectrum_ = true;
-                    updatedCache = true;
                 }
                 f->glDeleteSync(outputFences_[readIndex]);
                 outputFences_[readIndex] = nullptr;
@@ -226,12 +264,6 @@ public:
         }
 
         if (hasCachedSpectrum_) {
-            outSpectrum = cachedSpectrum_;
-            context_->doneCurrent();
-            return true;
-        }
-
-        if (updatedCache) {
             outSpectrum = cachedSpectrum_;
             context_->doneCurrent();
             return true;
@@ -276,6 +308,10 @@ private:
     bool initialized_ = false;
     int signalLength_ = 0;
     int numBins_ = 0;
+    int algorithmMode_ = 0;
+    int windowMode_ = 0;
+    int normalizationMode_ = 0;
+    int fftLength_ = 2;
     GLsync outputFences_[2] = {nullptr, nullptr};
     int activeOutputBufferIndex_ = 0;
     std::vector<float> cachedSpectrum_;
@@ -298,12 +334,28 @@ bool LoiaconoGpuCompute::configure(int signalLength,
                                    int numBins,
                                    const std::vector<double>& freqs,
                                    const std::vector<double>& norms,
-                                   const std::vector<int>& windowLens)
+                                   const std::vector<int>& windowLens,
+                                   int algorithmMode,
+                                   int windowMode,
+                                   int normalizationMode,
+                                   int fftLength)
 {
-    return impl_->configure(signalLength, numBins, freqs, norms, windowLens);
+    return impl_->configure(signalLength,
+                            numBins,
+                            freqs,
+                            norms,
+                            windowLens,
+                            algorithmMode,
+                            windowMode,
+                            normalizationMode,
+                            fftLength);
 }
 
-bool LoiaconoGpuCompute::compute(const std::vector<float>& ring, unsigned int offset, float leakiness, std::vector<float>& outSpectrum)
+bool LoiaconoGpuCompute::compute(const std::vector<float>& ring,
+                                 unsigned int offset,
+                                 unsigned int availableSamples,
+                                 float leakiness,
+                                 std::vector<float>& outSpectrum)
 {
-    return impl_->compute(ring, offset, leakiness, outSpectrum);
+    return impl_->compute(ring, offset, availableSamples, leakiness, outSpectrum);
 }

@@ -6,9 +6,6 @@ LEAKINESS_DECL
 
 layout(local_size_x = THREADS_PER_WORKGROUP, local_size_y = 1, local_size_z = 1) in;
 
-shared float sharedTr[THREADS_PER_WORKGROUP];
-shared float sharedTi[THREADS_PER_WORKGROUP];
-
 float windowWeight(int mode, int index, int len)
 {
     if (len <= 1) return 1.0;
@@ -23,46 +20,36 @@ float windowWeight(int mode, int index, int len)
 void main()
 {
     uint frequencyIx = gl_WorkGroupID.x;
-    uint threadIx = gl_LocalInvocationID.x;
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+
     int validSamples = min(windowLen[frequencyIx], int(min(params[1], uint(SIGNAL_LENGTH))));
     if (validSamples <= 0) {
-        if (threadIx == 0u) {
-            L[frequencyIx] = 0.0;
-        }
+        L[frequencyIx] = 0.0;
         return;
     }
 
     uint ringStart = (params[0] + uint(SIGNAL_LENGTH - validSamples)) % uint(SIGNAL_LENGTH);
-    float freq = f[frequencyIx];
-    float scale = norm[frequencyIx];
+    float omega = 2.0 * PI * f[frequencyIx];
+    float coeff = 2.0 * cos(omega);
+    float q0 = 0.0;
+    float q1 = 0.0;
+    float q2 = 0.0;
     int windowMode = int(params[3]);
 
-    float tr = 0.0;
-    float ti = 0.0;
-    for (int k = int(threadIx); k < validSamples; k += THREADS_PER_WORKGROUP) {
+    for (int k = 0; k < validSamples; ++k) {
         uint readIx = (ringStart + uint(k)) % uint(SIGNAL_LENGTH);
-        float sampleValue = x[readIx];
         float weight = windowMode == 5
             ? pow(LEAKINESS_VALUE, float(validSamples - 1 - k))
             : windowWeight(windowMode, k, validSamples);
-        float angle = 2.0 * PI * freq * float(k);
-        tr += sampleValue * cos(angle) * scale * weight;
-        ti -= sampleValue * sin(angle) * scale * weight;
+        float sampleValue = x[readIx] * weight;
+        q0 = sampleValue + coeff * q1 - q2;
+        q2 = q1;
+        q1 = q0;
     }
 
-    sharedTr[threadIx] = tr;
-    sharedTi[threadIx] = ti;
-    barrier();
-
-    for (uint stride = THREADS_PER_WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
-        if (threadIx < stride) {
-            sharedTr[threadIx] += sharedTr[threadIx + stride];
-            sharedTi[threadIx] += sharedTi[threadIx + stride];
-        }
-        barrier();
-    }
-
-    if (threadIx == 0u) {
-        L[frequencyIx] = sqrt(sharedTr[0] * sharedTr[0] + sharedTi[0] * sharedTi[0]);
-    }
+    float realPart = q1 - q2 * cos(omega);
+    float imagPart = q2 * sin(omega);
+    L[frequencyIx] = sqrt(realPart * realPart + imagPart * imagPart) * norm[frequencyIx];
 }

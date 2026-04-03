@@ -84,6 +84,32 @@ const char* LoiaconoRolling::windowModeName(WindowMode mode)
     return "unknown";
 }
 
+const char* LoiaconoRolling::windowLengthModeName(WindowLengthMode mode)
+{
+    switch (mode) {
+    case WindowLengthMode::ConstantSamples:
+        return "constant";
+    case WindowLengthMode::SqrtPeriod:
+        return "sqrt";
+    case WindowLengthMode::PeriodMultiple:
+        return "periods";
+    }
+    return "unknown";
+}
+
+const char* LoiaconoRolling::algorithmModeName(AlgorithmMode mode)
+{
+    switch (mode) {
+    case AlgorithmMode::Loiacono:
+        return "loiacono";
+    case AlgorithmMode::FFT:
+        return "fft";
+    case AlgorithmMode::Goertzel:
+        return "goertzel";
+    }
+    return "unknown";
+}
+
 const char* LoiaconoRolling::normalizationModeName(NormalizationMode mode)
 {
     switch (mode) {
@@ -135,6 +161,7 @@ double LoiaconoRolling::effectiveLeakiness() const
 
 bool LoiaconoRolling::usesRollingState() const
 {
+    if (algorithmMode_ != AlgorithmMode::Loiacono) return false;
     return windowMode_ == WindowMode::RectangularWindow || windowMode_ == WindowMode::LeakyWindow;
 }
 
@@ -189,8 +216,25 @@ bool LoiaconoRolling::ensureGpuBackendsConfiguredLocked()
     }
 
     bool rollingOk = gpuRollingCompute_->configure(RING_SIZE, 2048, numBins_, freqs_, norms_, windowLens_);
-    bool computeOk = gpuCompute_->configure(RING_SIZE, numBins_, freqs_, norms_, windowLens_);
-    bool vulkanOk = vulkanCompute_->configure(RING_SIZE, numBins_, freqs_, norms_, windowLens_);
+    const int fftLength = fftWindowLengthForCurrentConfig();
+    bool computeOk = gpuCompute_->configure(RING_SIZE,
+                                            numBins_,
+                                            freqs_,
+                                            norms_,
+                                            windowLens_,
+                                            static_cast<int>(algorithmMode_),
+                                            static_cast<int>(windowMode_),
+                                            static_cast<int>(normalizationMode_),
+                                            fftLength);
+    bool vulkanOk = vulkanCompute_->configure(RING_SIZE,
+                                              numBins_,
+                                              freqs_,
+                                              norms_,
+                                              windowLens_,
+                                              static_cast<int>(algorithmMode_),
+                                              static_cast<int>(windowMode_),
+                                              static_cast<int>(normalizationMode_),
+                                              fftLength);
     return rollingOk || computeOk || vulkanOk;
 }
 
@@ -204,11 +248,28 @@ void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out) con
     snapshot.ringHead = ringHead_;
     snapshot.sampleCount = sampleCount_;
     snapshot.windowMode = windowMode_;
+    snapshot.algorithmMode = algorithmMode_;
     snapshot.leakiness = effectiveLeakiness();
     computeSpectrumFromSnapshot(snapshot, out);
 }
 
 void LoiaconoRolling::computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+{
+    switch (snapshot.algorithmMode) {
+    case AlgorithmMode::Loiacono:
+        computeSpectrumLoiaconoFromSnapshot(snapshot, out);
+        return;
+    case AlgorithmMode::FFT:
+        computeSpectrumFftFromSnapshot(snapshot, out);
+        return;
+    case AlgorithmMode::Goertzel:
+        computeSpectrumGoertzelFromSnapshot(snapshot, out);
+        return;
+    }
+    out.assign(snapshot.freqs.size(), 0.0f);
+}
+
+void LoiaconoRolling::computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
 {
     const int numBins = static_cast<int>(snapshot.freqs.size());
     out.resize(numBins);
@@ -286,6 +347,169 @@ void LoiaconoRolling::computeSpectrumFromSnapshot(const SpectrumSnapshot& snapsh
     }
 }
 
+void LoiaconoRolling::computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+{
+    const int numBins = static_cast<int>(snapshot.freqs.size());
+    out.resize(numBins);
+    std::unordered_map<int, const std::vector<float>*> windowCache;
+    if (snapshot.windowMode != WindowMode::RectangularWindow && snapshot.windowMode != WindowMode::LeakyWindow) {
+        for (int fi = 0; fi < numBins; ++fi) {
+            const int wlen = snapshot.windowLens[fi];
+            const uint64_t startSample = snapshot.sampleCount > static_cast<uint64_t>(wlen)
+                ? (snapshot.sampleCount - static_cast<uint64_t>(wlen))
+                : 0;
+            const int validSamples = static_cast<int>(snapshot.sampleCount - startSample);
+            if (windowCache.find(validSamples) == windowCache.end()) {
+                windowCache.emplace(validSamples, &cachedWindowWeights(validSamples));
+            }
+        }
+    }
+
+    auto processRange = [&](int begin, int end) {
+        for (int fi = begin; fi < end; ++fi) {
+            const double f = snapshot.freqs[fi];
+            const double norm = snapshot.norms[fi];
+            const int wlen = snapshot.windowLens[fi];
+            const uint64_t startSample = snapshot.sampleCount > static_cast<uint64_t>(wlen)
+                ? (snapshot.sampleCount - static_cast<uint64_t>(wlen))
+                : 0;
+            const int validSamples = static_cast<int>(snapshot.sampleCount - startSample);
+            const int readOffset = (snapshot.ringHead - validSamples + RING_SIZE) % RING_SIZE;
+            const std::vector<float>* weights = nullptr;
+            if (snapshot.windowMode != WindowMode::RectangularWindow && snapshot.windowMode != WindowMode::LeakyWindow) {
+                weights = windowCache.at(validSamples);
+            }
+
+            const double omega = TWO_PI * f;
+            const double coeff = 2.0 * std::cos(omega);
+            double q0 = 0.0;
+            double q1 = 0.0;
+            double q2 = 0.0;
+            for (int k = 0; k < validSamples; ++k) {
+                const int ringIdx = (readOffset + k) % RING_SIZE;
+                const float sample = snapshot.ring[ringIdx];
+                const double weight = weights ? (*weights)[static_cast<size_t>(k)] : 1.0;
+                q0 = sample * weight + coeff * q1 - q2;
+                q2 = q1;
+                q1 = q0;
+            }
+            const double real = q1 - q2 * std::cos(omega);
+            const double imag = q2 * std::sin(omega);
+            out[fi] = static_cast<float>(std::sqrt(real * real + imag * imag) * norm);
+        }
+    };
+
+    unsigned int threads = std::min<unsigned int>(workerCount_, std::max(1, numBins));
+    if (threads <= 1 || numBins < 64) {
+        processRange(0, numBins);
+        return;
+    }
+    std::vector<std::future<void>> jobs;
+    jobs.reserve(threads);
+    int binsPerThread = (numBins + static_cast<int>(threads) - 1) / static_cast<int>(threads);
+    for (unsigned int t = 0; t < threads; ++t) {
+        int begin = static_cast<int>(t) * binsPerThread;
+        int end = std::min(numBins, begin + binsPerThread);
+        if (begin >= end) break;
+        jobs.push_back(std::async(std::launch::async, processRange, begin, end));
+    }
+    for (auto& job : jobs) {
+        job.get();
+    }
+}
+
+int LoiaconoRolling::fftWindowLengthForCurrentConfig() const
+{
+    int maxWindow = 2;
+    for (int wlen : windowLens_) {
+        maxWindow = std::max(maxWindow, wlen);
+    }
+    int fftLen = 1;
+    while (fftLen * 2 <= maxWindow && fftLen * 2 <= RING_SIZE) {
+        fftLen *= 2;
+    }
+    return std::max(2, fftLen);
+}
+
+std::vector<double> LoiaconoRolling::fftWindowWeights(int wlen) const
+{
+    std::vector<double> weights(static_cast<size_t>(std::max(1, wlen)), 1.0);
+    for (int i = 0; i < wlen; ++i) {
+        weights[static_cast<size_t>(i)] = windowWeightAt(i, wlen);
+    }
+    return weights;
+}
+
+void LoiaconoRolling::fftInPlace(std::vector<std::complex<double>>& data) const
+{
+    const int n = static_cast<int>(data.size());
+    int j = 0;
+    for (int i = 1; i < n; ++i) {
+        int bit = n >> 1;
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if (i < j) std::swap(data[static_cast<size_t>(i)], data[static_cast<size_t>(j)]);
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        const double angle = -TWO_PI / static_cast<double>(len);
+        const std::complex<double> wlen(std::cos(angle), std::sin(angle));
+        for (int i = 0; i < n; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            for (int j2 = 0; j2 < len / 2; ++j2) {
+                const auto u = data[static_cast<size_t>(i + j2)];
+                const auto v = data[static_cast<size_t>(i + j2 + len / 2)] * w;
+                data[static_cast<size_t>(i + j2)] = u + v;
+                data[static_cast<size_t>(i + j2 + len / 2)] = u - v;
+                w *= wlen;
+            }
+        }
+    }
+}
+
+void LoiaconoRolling::computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+{
+    const int numBins = static_cast<int>(snapshot.freqs.size());
+    out.assign(numBins, 0.0f);
+    const int fftLen = fftWindowLengthForCurrentConfig();
+    const int validSamples = std::min<int>(fftLen, static_cast<int>(std::min<uint64_t>(snapshot.sampleCount, static_cast<uint64_t>(fftLen))));
+    if (validSamples <= 0) return;
+
+    const auto weights = fftWindowWeights(validSamples);
+    const double fftNorm = normalizationScaleForWindow(validSamples);
+    std::vector<std::complex<double>> data(static_cast<size_t>(fftLen), std::complex<double>(0.0, 0.0));
+    const int readOffset = (snapshot.ringHead - validSamples + RING_SIZE) % RING_SIZE;
+    for (int k = 0; k < validSamples; ++k) {
+        const int ringIdx = (readOffset + k) % RING_SIZE;
+        data[static_cast<size_t>(k)] = std::complex<double>(snapshot.ring[ringIdx] * weights[static_cast<size_t>(k)], 0.0);
+    }
+
+    fftInPlace(data);
+
+    const int nyquist = fftLen / 2;
+    std::vector<double> magnitudes(static_cast<size_t>(nyquist + 1), 0.0);
+    for (int i = 0; i <= nyquist; ++i) {
+        magnitudes[static_cast<size_t>(i)] = std::abs(data[static_cast<size_t>(i)]) * fftNorm;
+    }
+
+    for (int fi = 0; fi < numBins; ++fi) {
+        const double targetIndex = snapshot.freqs[fi] * fftLen;
+        if (targetIndex <= 0.0) {
+            out[fi] = static_cast<float>(magnitudes.front());
+        } else if (targetIndex >= nyquist) {
+            out[fi] = static_cast<float>(magnitudes.back());
+        } else {
+            const int i0 = static_cast<int>(std::floor(targetIndex));
+            const int i1 = std::min(nyquist, i0 + 1);
+            const double frac = targetIndex - static_cast<double>(i0);
+            out[fi] = static_cast<float>(magnitudes[static_cast<size_t>(i0)] * (1.0 - frac)
+                + magnitudes[static_cast<size_t>(i1)] * frac);
+        }
+    }
+}
+
 void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMax,
                                  int numBins, int multiple)
 {
@@ -304,21 +528,32 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     double logStep = numBins > 1 ? (logMax - logMin) / (numBins - 1) : 0.0;
 
     // Configure bins with Goertzel scaling:
-    // - Window length scales inversely with frequency (constant Q)
+    // - Window length follows the selected frequency-to-window mapping
     // - Normalization scales as 1/sqrt(window_length) for amplitude consistency
     // - Window length is limited to RING_SIZE to prevent ring buffer overflow
+    const double maxFreqNorm = std::exp(logMax) / sampleRate;
+    const double safeMaxFreqNorm = std::max(maxFreqNorm, 1.0 / sampleRate);
+    const double baseWindow = static_cast<double>(multiple) / safeMaxFreqNorm;
+    double windowLengthExponent = 1.0;
+    switch (windowLengthMode_) {
+    case WindowLengthMode::ConstantSamples:
+        windowLengthExponent = 0.0;
+        break;
+    case WindowLengthMode::SqrtPeriod:
+        windowLengthExponent = 0.5;
+        break;
+    case WindowLengthMode::PeriodMultiple:
+        windowLengthExponent = 1.0;
+        break;
+    }
     for (int i = 0; i < numBins; i++) {
         double fHz = std::exp(logMin + i * logStep);
         double fNorm = fHz / sampleRate;
         freqs_[i] = fNorm;
 
-        // Limit window to ring buffer size, but also limit multiple for low frequencies
-        // to ensure the intended window fits in the ring buffer
-        int maxMultipleForFreq = static_cast<int>(RING_SIZE * fNorm);
-        int effectiveMultiple = std::min(multiple, maxMultipleForFreq);
-        effectiveMultiple = std::max(effectiveMultiple, 2);  // At least 2 periods
-        
-        int wlen = static_cast<int>(effectiveMultiple / fNorm);
+        const double freqRatio = std::clamp(safeMaxFreqNorm / std::max(fNorm, 1.0 / sampleRate), 1.0, static_cast<double>(RING_SIZE));
+        int wlen = static_cast<int>(std::lround(baseWindow * std::pow(freqRatio, windowLengthExponent)));
+        wlen = std::max(wlen, 2);
         wlen = std::min(wlen, RING_SIZE);
         windowLens_[i] = wlen;
         // Goertzel amplitude scaling: 1/sqrt(N) to normalize for window size
@@ -466,18 +701,29 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
         std::lock_guard<std::mutex> lock(mutex_);
         const float leak = static_cast<float>(effectiveLeakiness());
         
-        if ((activeComputeMode() == ComputeMode::GpuCompute || activeComputeMode() == ComputeMode::VulkanCompute) && usesRollingState()) {
-            if (activeComputeMode() == ComputeMode::VulkanCompute) {
-                if (vulkanCompute_ && vulkanCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), leak, out)) {
+        const auto activeMode = activeComputeMode();
+        if (activeMode == ComputeMode::GpuCompute || activeMode == ComputeMode::VulkanCompute) {
+            const unsigned int availableSamples = static_cast<unsigned int>(
+                std::min<uint64_t>(sampleCount_, static_cast<uint64_t>(RING_SIZE)));
+            if (activeMode == ComputeMode::VulkanCompute) {
+                if (vulkanCompute_ && vulkanCompute_->compute(ring_,
+                                                              static_cast<unsigned int>(ringHead_),
+                                                              availableSamples,
+                                                              leak,
+                                                              out)) {
                     return;
                 }
             } else {
-                if (gpuCompute_ && gpuCompute_->compute(ring_, static_cast<unsigned int>(ringHead_), leak, out)) {
+                if (gpuCompute_ && gpuCompute_->compute(ring_,
+                                                        static_cast<unsigned int>(ringHead_),
+                                                        availableSamples,
+                                                        leak,
+                                                        out)) {
                     return;
                 }
             }
 
-            if (!pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
+            if (usesRollingState() && !pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
                 auto& chunks = const_cast<std::deque<GpuChunkDelta>&>(pendingGpuChunks_);
                 auto& overflowed = const_cast<bool&>(pendingGpuChunksOverflowed_);
 
@@ -509,6 +755,7 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
             snapshot.sampleCount = sampleCount_;
             snapshot.computeMode = computeMode_;
             snapshot.windowMode = windowMode_;
+            snapshot.algorithmMode = algorithmMode_;
             snapshot.leakiness = effectiveLeakiness();
             if (usesRollingState()) {
                 snapshot.tr = Tr_;
@@ -524,6 +771,45 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
     }
 
     computeSpectrumFromSnapshot(snapshot, out);
+}
+
+void LoiaconoRolling::getSpectraAtSampleCounts(const std::vector<uint64_t>& sampleCounts,
+                                               std::vector<std::vector<float>>& out) const
+{
+    out.clear();
+    if (sampleCounts.empty()) return;
+
+    SpectrumSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot.ring = ring_;
+        snapshot.freqs = freqs_;
+        snapshot.norms = norms_;
+        snapshot.windowLens = windowLens_;
+        snapshot.ringHead = ringHead_;
+        snapshot.sampleCount = sampleCount_;
+        snapshot.computeMode = computeMode_;
+        snapshot.windowMode = windowMode_;
+        snapshot.algorithmMode = algorithmMode_;
+        snapshot.leakiness = effectiveLeakiness();
+    }
+
+    out.resize(sampleCounts.size());
+    for (size_t i = 0; i < sampleCounts.size(); ++i) {
+        SpectrumSnapshot historical = snapshot;
+        const uint64_t clampedSampleCount = std::min(sampleCounts[i], snapshot.sampleCount);
+        const uint64_t delta = snapshot.sampleCount - clampedSampleCount;
+        if (delta >= static_cast<uint64_t>(RING_SIZE)) {
+            historical.sampleCount = snapshot.sampleCount > static_cast<uint64_t>(RING_SIZE)
+                ? (snapshot.sampleCount - static_cast<uint64_t>(RING_SIZE - 1))
+                : 0;
+            historical.ringHead = (snapshot.ringHead - (RING_SIZE - 1) + RING_SIZE) % RING_SIZE;
+        } else {
+            historical.sampleCount = clampedSampleCount;
+            historical.ringHead = (snapshot.ringHead - static_cast<int>(delta) + RING_SIZE) % RING_SIZE;
+        }
+        computeSpectrumFromSnapshot(historical, out[i]);
+    }
 }
 
 LoiaconoRolling::Stats LoiaconoRolling::getStats() const
