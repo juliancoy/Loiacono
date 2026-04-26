@@ -5,6 +5,7 @@
 #include <QRect>
 #include <QPoint>
 #include <QJsonArray>
+#include <QString>
 #include <vector>
 #include "loiacono_rolling.h"
 
@@ -167,4 +168,11 @@ private:
     std::vector<double> pitchHistory_;
     static constexpr size_t MAX_PITCH_HISTORY = 8;
     double smoothedPitchHz_ = 0;
+    double displayPitchHz_ = 0.0;
+    double displayPitchCents_ = 0.0;
+    double displayPitchConfidence_ = 0.0;
+    int displayPitchMidiNote_ = -1;
+    QString displayPitchNoteName_;
+    qint64 lastPitchUpdateMs_ = 0;
+    static constexpr qint64 PITCH_PERSIST_MS = 3000;
 };

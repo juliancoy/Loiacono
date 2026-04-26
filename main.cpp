@@ -13,6 +13,7 @@
 #include <QCheckBox>
 #include <QDialog>
 #include <QSplitter>
+#include <QTabWidget>
 #include <QLockFile>
 #include <QStandardPaths>
 #include <QDir>
@@ -576,7 +577,6 @@ int main(int argc, char* argv[])
     auto* fieldBins = makeSlider("Bins", slBins, 32, 2400, numBins, "", lbBins);
     auto* fieldFreqMin = makeSlider("Freq min", slMin, 20, 2000, freqMin, " Hz", lbMin);
     auto* fieldFreqMax = makeSlider("Freq max", slMax, 500, 12000, freqMax, " Hz", lbMax);
-    paramsLayout->addWidget(row1, 0);
 
     // ── Settings row 2: Display And Pitch ──
     QSlider *slGain, *slGamma, *slFloor, *slLeakiness, *slDisplaySeconds, *slBaseA, *slDisplayReference;
@@ -600,7 +600,6 @@ int main(int argc, char* argv[])
     int baseAValue = std::clamp(savedState.baseAHundredths, 40000, 50000);
     row2Lay->addWidget(makeFloatSlider("Base A", slBaseA, lbBaseA, 40000, 50000, baseAValue, 100.0f, " Hz"), 3, 0, 1, 2);
     transform.setBaseAFrequency(baseAValue / 100.0);
-    paramsLayout->addWidget(row2, 0);
 
     // ── Settings row 3: Input + execution/display mode ──
     auto* row3 = new QGroupBox("Audio");
@@ -763,7 +762,6 @@ int main(int argc, char* argv[])
     audioFlagsLay->addWidget(cbExclusive, 1, 0);
     audioFlagsLay->addWidget(cbAlsaDefault, 1, 1);
     row3Lay->addWidget(audioFlags, 4, 1);
-    paramsLayout->addWidget(row3, 0);
 
     auto* row4 = new QGroupBox("Display Options");
     auto* row4Lay = new QGridLayout(row4);
@@ -798,7 +796,6 @@ int main(int argc, char* argv[])
     togglesLay->addWidget(cbShowGrid, 0, 0);
     togglesLay->addWidget(cbBufferEdges, 0, 1);
     row4Lay->addWidget(toggles, 2, 0, 1, 2);
-    paramsLayout->addWidget(row4, 0);
 
     auto* topBar = new QWidget;
     topBar->setMaximumHeight(34);
@@ -841,7 +838,36 @@ int main(int argc, char* argv[])
     auto* toneCurveButton = new QPushButton("Curves...");
     toneCurveButton->setStyleSheet("QPushButton { font-size: 11px; padding: 4px 8px; }");
     row4Lay->addWidget(toneCurveButton, 3, 0, 1, 2, Qt::AlignLeft);
-    paramsLayout->addStretch(1);
+
+    auto* paramsTabs = new QTabWidget(paramsWindow);
+    paramsTabs->setDocumentMode(true);
+
+    auto* transformTab = new QWidget(paramsTabs);
+    auto* transformTabLayout = new QVBoxLayout(transformTab);
+    transformTabLayout->setContentsMargins(6, 6, 6, 6);
+    transformTabLayout->setSpacing(8);
+    transformTabLayout->addWidget(row1);
+    transformTabLayout->addStretch(1);
+
+    auto* displayTab = new QWidget(paramsTabs);
+    auto* displayTabLayout = new QVBoxLayout(displayTab);
+    displayTabLayout->setContentsMargins(6, 6, 6, 6);
+    displayTabLayout->setSpacing(8);
+    displayTabLayout->addWidget(row2);
+    displayTabLayout->addWidget(row4);
+    displayTabLayout->addStretch(1);
+
+    auto* audioTab = new QWidget(paramsTabs);
+    auto* audioTabLayout = new QVBoxLayout(audioTab);
+    audioTabLayout->setContentsMargins(6, 6, 6, 6);
+    audioTabLayout->setSpacing(8);
+    audioTabLayout->addWidget(row3);
+    audioTabLayout->addStretch(1);
+
+    paramsTabs->addTab(transformTab, "Transform");
+    paramsTabs->addTab(displayTab, "Display");
+    paramsTabs->addTab(audioTab, "Audio");
+    paramsLayout->addWidget(paramsTabs, 1);
 
     window->setCentralWidget(central);
     auto* statusBar = window->statusBar();

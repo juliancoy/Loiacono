@@ -7,6 +7,7 @@
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QSurfaceFormat>
+#include <QStringList>
 
 #include <algorithm>
 #include <cstring>
@@ -31,11 +32,22 @@ QString shaderTemplateName(int algorithmMode)
 
 QString loadShaderTemplate(int algorithmMode)
 {
-    const QString path = QDir(QCoreApplication::applicationDirPath())
-        .absoluteFilePath(QStringLiteral("../../shaders/%1").arg(shaderTemplateName(algorithmMode)));
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
-    return QString::fromUtf8(file.readAll());
+    const QString shaderFile = shaderTemplateName(algorithmMode);
+    const QStringList candidates = {
+#ifdef LOIACONO_SHADER_DIR
+        QDir(QStringLiteral(LOIACONO_SHADER_DIR)).absoluteFilePath(shaderFile),
+#endif
+        QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("../../shaders/%1").arg(shaderFile)),
+        QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("../loiacono/shaders/%1").arg(shaderFile)),
+        QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(QStringLiteral("shaders/%1").arg(shaderFile))
+    };
+    for (const QString &path : candidates) {
+        QFile file(path);
+        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return QString::fromUtf8(file.readAll());
+        }
+    }
+    return {};
 }
 
 QString buildShaderSource(int signalLength, int algorithmMode)

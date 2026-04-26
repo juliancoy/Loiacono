@@ -203,6 +203,12 @@ void SpectrogramWidget::resetHistory()
     pitchHistory_.clear();
     smoothedPitchHz_ = 0.0;
     frameStats_.pitch = {};
+    displayPitchHz_ = 0.0;
+    displayPitchCents_ = 0.0;
+    displayPitchConfidence_ = 0.0;
+    displayPitchMidiNote_ = -1;
+    displayPitchNoteName_.clear();
+    lastPitchUpdateMs_ = 0;
     lastColumnSampleCount_ = transform_->getStats().totalSamples;
     pendingColumnFraction_ = 0.0;
     pendingGpuColumns_ = 0;
@@ -324,11 +330,13 @@ void SpectrogramWidget::paintSpectrumColumn(int imageX, const std::vector<float>
 {
     int nb = transform_->numBins();
     int h = image_.height();
-    if (imageX < 0 || imageX >= image_.width() || h <= 0 || nb <= 0 || spectrum.empty()) return;
+    const int spectrumBins = static_cast<int>(spectrum.size());
+    const int usableBins = std::min(nb, spectrumBins);
+    if (imageX < 0 || imageX >= image_.width() || h <= 0 || usableBins <= 0) return;
 
     for (int row = 0; row < h; ++row) {
-        double binF = (nb - 1) * (h - 1 - row) / std::max(1, h - 1);
-        int fi = static_cast<int>(std::clamp(std::floor(binF), 0.0, static_cast<double>(nb - 1)));
+        double binF = (usableBins - 1) * (h - 1 - row) / std::max(1, h - 1);
+        int fi = static_cast<int>(std::clamp(std::floor(binF), 0.0, static_cast<double>(usableBins - 1)));
         auto [r, g, b] = colormap(spectrum[fi]);
         auto* line = reinterpret_cast<QRgb*>(image_.scanLine(row));
         line[imageX] = qRgb(r, g, b);
@@ -591,6 +599,18 @@ void SpectrogramWidget::tick()
         frameStats_.pitch = {};
     }
 
+    if (!useDirectGpuPipeline()
+        && frameStats_.pitch.confidence > 0.2
+        && frameStats_.pitch.midiNote >= 0
+        && frameStats_.pitch.freqHz > 0.0) {
+        displayPitchHz_ = frameStats_.pitch.freqHz;
+        displayPitchCents_ = frameStats_.pitch.cents;
+        displayPitchConfidence_ = std::clamp(frameStats_.pitch.confidence, 0.0, 1.0);
+        displayPitchMidiNote_ = frameStats_.pitch.midiNote;
+        displayPitchNoteName_ = QString::fromStdString(frameStats_.pitch.noteName);
+        lastPitchUpdateMs_ = now;
+    }
+
     if (auto* glCanvas = dynamic_cast<GlSpectrogramCanvas*>(canvas_)) {
         glCanvas->requestRepaint();
     } else {
@@ -738,46 +758,21 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
 
     QStringList lines;
     lines << QString("FPS: %1").arg(frameStats_.fps, 0, 'f', 0);
-    lines << QString("Displayed: %1 s").arg(displaySeconds_, 0, 'f', 1);
-    lines << QString("Render: %1").arg(hardwareAccelerationEnabled_ ? "GPU" : "CPU");
-    lines << QString("Alg: %1").arg(LoiaconoRolling::algorithmModeName(transform_->algorithmMode()));
-    lines << QString("Norm: %1").arg(displayNormalizationModeName(displayNormalizationMode_));
-    lines << QString("CPU thr: %1").arg(transform_->cpuThreads());
-    lines << QString("Compute: %1").arg(LoiaconoRolling::computeModeName(transform_->activeComputeMode()));
-    lines << QString("Bins: %1 scale:%2").arg(stats.currentBins).arg(stats.currentMultiple);
-    lines << QString("Wlen: %1").arg(LoiaconoRolling::windowLengthModeName(transform_->windowLengthMode()));
-    lines << QString("CPU: %1%").arg(stats.cpuLoadPercent, 0, 'f', 1);
-    lines << QString("%1 kS/s").arg(stats.samplesPerSecond / 1000.0, 0, 'f', 1);
+    lines << QString("Span: %1 s").arg(displaySeconds_, 0, 'f', 1);
+    lines << QString("Mode: %1/%2")
+             .arg(hardwareAccelerationEnabled_ ? "gpu" : "cpu")
+             .arg(LoiaconoRolling::computeModeName(transform_->activeComputeMode()));
+    lines << QString("Algo: %1").arg(LoiaconoRolling::algorithmModeName(transform_->algorithmMode()));
+    lines << QString("Bins: %1 x%2").arg(stats.currentBins).arg(stats.currentMultiple);
+    lines << QString("Load: %1%  %2 kS/s")
+             .arg(stats.cpuLoadPercent, 0, 'f', 1)
+             .arg(stats.samplesPerSecond / 1000.0, 0, 'f', 1);
     if (!directGpu) {
-        lines.insert(1, QString("Peak: %1 Hz").arg(frameStats_.peakHz, 0, 'f', 0));
-    }
-    
-    // Add pitch detection info with sharp/flat indicators
-    if (!directGpu && frameStats_.pitch.confidence > 0.2) {
-        QString directionStr;
-        auto direction = LoiaconoRolling::getPitchDirection(frameStats_.pitch.cents, 5.0);
-        if (direction == LoiaconoRolling::PitchDirection::Flat) {
-            directionStr = "\u25BC";  // Down triangle (flat)
-        } else if (direction == LoiaconoRolling::PitchDirection::Sharp) {
-            directionStr = "\u25B2";  // Up triangle (sharp)
-        } else {
-            directionStr = "\u25CF";  // Circle (in tune)
-        }
-        
-        QString centsStr;
-        if (std::abs(frameStats_.pitch.cents) < 5) {
-            centsStr = "=";  // In tune
-        } else {
-            centsStr = QString("%1%2").arg(frameStats_.pitch.cents > 0 ? "+" : "")
-                                       .arg(static_cast<int>(std::round(frameStats_.pitch.cents)));
-        }
-        lines << QString("Pitch: %1 %2 %3").arg(frameStats_.pitch.noteName).arg(directionStr).arg(centsStr);
-        lines << QString("  %1 Hz (%2%)").arg(frameStats_.pitch.freqHz, 0, 'f', 1)
-                                          .arg(frameStats_.pitch.confidence * 100, 0, 'f', 0);
+        lines << QString("Peak: %1 Hz").arg(frameStats_.peakHz, 0, 'f', 0);
     }
 
     int lineH = 13;
-    int boxW = 136;
+    int boxW = 148;
     int boxH = lines.size() * lineH + 6;
     int boxX = spectRect.right() - boxW - 3;
     int boxY = 4;
@@ -789,6 +784,104 @@ void SpectrogramWidget::paintDecorations(QPainter& p, const QSize& canvasSize)
     p.setPen(QColor(160, 200, 255));
     for (int i = 0; i < lines.size(); i++) {
         p.drawText(boxX + 4, boxY + 12 + i * lineH, lines[i]);
+    }
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 pitchAgeMs = lastPitchUpdateMs_ > 0
+        ? std::max<qint64>(0, nowMs - lastPitchUpdateMs_)
+        : (PITCH_PERSIST_MS + 1);
+    const double pitchFade = std::clamp(
+        1.0 - (static_cast<double>(pitchAgeMs) / static_cast<double>(PITCH_PERSIST_MS)),
+        0.0, 1.0);
+    const double pitchStrength = std::clamp(displayPitchConfidence_ * pitchFade, 0.0, 1.0);
+    const bool showPitchDial = displayPitchMidiNote_ >= 0 && pitchStrength > 0.03;
+
+    int dialSize = 84;
+    int dialX = boxX + boxW - dialSize - 6;
+    int dialY = boxY + boxH + 6;
+    if (dialY + dialSize + 36 > spectRect.bottom()) {
+        dialY = boxY + 2;
+        dialX = std::max(spectRect.left() + 6, boxX - dialSize - 8);
+    }
+    dialX = std::clamp(dialX, spectRect.left() + 4, spectRect.right() - dialSize - 4);
+    dialY = std::clamp(dialY, spectRect.top() + 4, spectRect.bottom() - dialSize - 30);
+
+    QRect dialPanel(dialX - 6, dialY - 12, dialSize + 12, dialSize + 36);
+    p.fillRect(dialPanel, QColor(0, 0, 0, 175));
+    p.setPen(QColor(30, 30, 50));
+    p.drawRect(dialPanel);
+
+    QRectF dialRect(dialX, dialY, dialSize, dialSize);
+    auto centsToDegrees = [](double cents) {
+        const double clamped = std::clamp(cents, -50.0, 50.0);
+        return 225.0 - ((clamped + 50.0) / 100.0) * 270.0;
+    };
+
+    p.setPen(QPen(QColor(70, 80, 95), 4));
+    p.drawArc(dialRect, 225 * 16, -270 * 16);
+
+    const int ringAlpha = static_cast<int>(70 + 185 * pitchStrength);
+    p.setPen(QPen(QColor(80, 210, 120, ringAlpha), 4));
+    const int tuneStart = static_cast<int>(std::round(centsToDegrees(-5.0) * 16.0));
+    const int tuneSpan = static_cast<int>(std::round((centsToDegrees(5.0) - centsToDegrees(-5.0)) * 16.0));
+    p.drawArc(dialRect, tuneStart, tuneSpan);
+
+    const double shownCents = showPitchDial ? std::clamp(displayPitchCents_, -50.0, 50.0) : 0.0;
+    const double needleDeg = centsToDegrees(shownCents);
+    constexpr double kPi = 3.14159265358979323846;
+    const double needleRad = needleDeg * (kPi / 180.0);
+    const QPointF center = dialRect.center();
+    const double radius = (dialSize * 0.5) - 8.0;
+    const QPointF needleEnd(center.x() + radius * std::cos(needleRad),
+                            center.y() - radius * std::sin(needleRad));
+
+    QColor needleColor(150, 160, 175);
+    if (showPitchDial) {
+        const double absCents = std::abs(shownCents);
+        if (absCents <= 5.0) {
+            needleColor = QColor(80, 220, 120, ringAlpha);
+        } else if (absCents <= 15.0) {
+            needleColor = QColor(240, 210, 80, ringAlpha);
+        } else {
+            needleColor = QColor(255, 120, 90, ringAlpha);
+        }
+    }
+    p.setPen(QPen(needleColor, 3));
+    p.drawLine(center, needleEnd);
+    p.setBrush(QColor(210, 220, 235, 220));
+    p.setPen(Qt::NoPen);
+    p.drawEllipse(center, 3, 3);
+
+    QFont pitchLabelFont("Menlo", 9, QFont::Bold);
+    p.setFont(pitchLabelFont);
+    p.setPen(QColor(185, 210, 235));
+    p.drawText(QRect(dialX, dialY - 10, dialSize, 10), Qt::AlignCenter, "Pitch");
+
+    QString noteText = showPitchDial ? displayPitchNoteName_ : "--";
+    QString centsText = showPitchDial
+        ? QString("%1%2 c").arg(shownCents >= 0 ? "+" : "").arg(static_cast<int>(std::lround(shownCents)))
+        : "-- c";
+    QString freqText = showPitchDial
+        ? QString("%1 Hz").arg(displayPitchHz_, 0, 'f', 1)
+        : "-- Hz";
+
+    p.setPen(QColor(225, 235, 255, 235));
+    p.drawText(QRect(dialX, dialY + 24, dialSize, 16), Qt::AlignCenter, noteText);
+
+    QFont pitchInfoFont("Menlo", 8);
+    p.setFont(pitchInfoFont);
+    p.setPen(QColor(180, 200, 225, 220));
+    p.drawText(QRect(dialX, dialY + dialSize - 22, dialSize, 12), Qt::AlignCenter, centsText);
+    p.drawText(QRect(dialX, dialY + dialSize - 10, dialSize, 12), Qt::AlignCenter, freqText);
+
+    QRect confidenceBar(dialX + 6, dialY + dialSize + 16, dialSize - 12, 6);
+    p.setPen(QColor(70, 80, 95));
+    p.setBrush(QColor(20, 20, 30, 220));
+    p.drawRect(confidenceBar);
+    int confidenceWidth = static_cast<int>(std::round((confidenceBar.width() - 2) * std::clamp(pitchStrength, 0.0, 1.0)));
+    if (confidenceWidth > 0) {
+        p.fillRect(confidenceBar.adjusted(1, 1, -1 - ((confidenceBar.width() - 2) - confidenceWidth), -1),
+                   QColor(80, 220, 140, 210));
     }
 
     if (!directGpu) {
@@ -864,6 +957,8 @@ void SpectrogramWidget::paintContent(QPainter& p, const QSize& canvasSize)
 {
     int nb = transform_->numBins();
     if (nb < 1) return;
+    const int spectrumBins = static_cast<int>(spectrum_.size());
+    const int usableBins = std::min(nb, spectrumBins);
 
     QRect spectRect = spectrogramRect(canvasSize);
     QRect histRect = histogramRect(canvasSize);
@@ -874,8 +969,8 @@ void SpectrogramWidget::paintContent(QPainter& p, const QSize& canvasSize)
     // Histogram background (dark)
     p.fillRect(histRect.adjusted(-1, 0, 1, 0), QColor(12, 12, 20));
 
-    if (!spectrum_.empty() && maxAmplitude_ > 0) {
-        for (int fi = 0; fi < nb; fi++) {
+    if (usableBins > 0 && maxAmplitude_ > 0) {
+        for (int fi = 0; fi < usableBins; fi++) {
             float t = visualLevel(spectrum_[fi]);
             int barW = static_cast<int>(t * histRect.width());
             if (barW < 1) continue;
