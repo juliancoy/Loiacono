@@ -107,7 +107,14 @@ void ApiServer::handleRequest(QTcpSocket* socket)
         });
 
     } else if (method == "GET" && path == "/api/screenshot") {
-        QImage img = spectrogram_->renderToImage();
+        // Capture the full app window UI when possible (controls + spectrogram).
+        // Fallback to spectrogram-only render if a top-level window is unavailable.
+        QImage img;
+        if (spectrogram_ && spectrogram_->window() && spectrogram_->window()->isVisible()) {
+            img = spectrogram_->window()->grab().toImage();
+        } else {
+            img = spectrogram_->renderToImage();
+        }
         QByteArray pngData;
         QBuffer buf(&pngData);
         buf.open(QIODevice::WriteOnly);

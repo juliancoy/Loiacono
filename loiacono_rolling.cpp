@@ -523,9 +523,25 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
     windowLens_.resize(numBins);
     norms_.resize(numBins);
 
-    double logMin = std::log(freqMin);
-    double logMax = std::log(freqMax);
-    double logStep = numBins > 1 ? (logMax - logMin) / (numBins - 1) : 0.0;
+    // Build a log-frequency grid that is anchored to 12TET/A440.
+    // We quantize the bin spacing to an integer "bins per semitone" whenever possible.
+    const double referenceA = std::max(1.0, baseAFreq_);
+    const double midiMinExact = 69.0 + 12.0 * std::log2(freqMin / referenceA);
+    const double midiMaxExact = 69.0 + 12.0 * std::log2(freqMax / referenceA);
+    const double semitoneSpan = std::max(1e-6, midiMaxExact - midiMinExact);
+    const int steps = std::max(1, numBins - 1);
+    const int binsPerSemitone = std::max(1, static_cast<int>(std::lround(steps / semitoneSpan)));
+    const double midiStep = 1.0 / static_cast<double>(binsPerSemitone);
+    const double totalMidiSpan = static_cast<double>(steps) * midiStep;
+    const double midiCenter = 0.5 * (midiMinExact + midiMaxExact);
+    const double midiStart = std::round((midiCenter - 0.5 * totalMidiSpan) / midiStep) * midiStep;
+    const double midiEnd = midiStart + totalMidiSpan;
+
+    const double freqMinGrid = referenceA * std::pow(2.0, (midiStart - 69.0) / 12.0);
+    const double freqMaxGrid = referenceA * std::pow(2.0, (midiEnd - 69.0) / 12.0);
+    const double logMin = std::log(freqMinGrid);
+    const double logMax = std::log(freqMaxGrid);
+    const double logStep = numBins > 1 ? (logMax - logMin) / static_cast<double>(numBins - 1) : 0.0;
 
     // Configure bins with Goertzel scaling:
     // - Window length follows the selected frequency-to-window mapping
@@ -935,43 +951,46 @@ LoiaconoRolling::PitchResult LoiaconoRolling::detectRootPitch(
     for (float v : spectrum) maxAmp = std::max(maxAmp, v);
     if (maxAmp < 1e-10f) return result;
     
-    // Search for fundamental using harmonic correlation
-    // For each candidate fundamental, compute correlation with harmonics
+    // Search for fundamental using harmonic correlation.
+    // Candidate scoring uses dense bin sampling to avoid systematic cents bias.
     double bestBin = 0;
     double bestScore = 0;
     
     const int numHarmonics = 6;  // Check up to 6th harmonic
     const double harmonicWeights[] = {1.0, 0.8, 0.6, 0.5, 0.4, 0.35};  // Fundamentals weighted more
     
-    // Step through candidate fundamentals in log space
-    int numSteps = std::max(10, numBins_ / 4);  // Reasonable resolution
-    for (int step = 0; step < numSteps; step++) {
-        double t = step / static_cast<double>(numSteps - 1);
-        double candidateBin = binMin + t * (binMax - binMin);
-        double candidateFreq = binToFreqHz(candidateBin);
-        
-        // Compute harmonic correlation score
+    auto scoreCandidateBin = [&](double candidateBin) -> double {
+        const double candidateFreq = binToFreqHz(candidateBin);
         double score = 0;
         double weightSum = 0;
-        
+
         for (int h = 0; h < numHarmonics; h++) {
             double harmonicFreq = candidateFreq * (h + 1);
             if (harmonicFreq > freqs_[numBins_ - 1] * sampleRate_ * 0.95) break;
-            
+
             double harmonicBin = freqToBin(harmonicFreq);
             float amp = interpolatedSpectrum(spectrum, harmonicBin) / maxAmp;  // Normalized
-            
-            // Weight by expected harmonic amplitude roll-off (higher harmonics usually weaker)
+
+            // Weight by expected harmonic amplitude roll-off (higher harmonics are weaker).
             score += amp * harmonicWeights[h];
             weightSum += harmonicWeights[h];
         }
-        
+
         if (weightSum > 0) {
             score /= weightSum;  // Normalize by weights
             // Penalize very low frequencies (often noise)
             if (candidateFreq < 80) score *= 0.8;
         }
-        
+
+        return score;
+    };
+
+    // Evaluate every bin in the search range for stable note-centered detection.
+    const int iMin = std::max(0, static_cast<int>(std::floor(binMin)));
+    const int iMax = std::min(numBins_ - 1, static_cast<int>(std::ceil(binMax)));
+    for (int i = iMin; i <= iMax; ++i) {
+        const double candidateBin = static_cast<double>(i);
+        const double score = scoreCandidateBin(candidateBin);
         if (score > bestScore) {
             bestScore = score;
             bestBin = candidateBin;
@@ -980,32 +999,22 @@ LoiaconoRolling::PitchResult LoiaconoRolling::detectRootPitch(
     
     if (bestScore < 0.05) return result;  // Too quiet/noisy
     
-    // Refine using quadratic interpolation around the peak
+    // Refine peak using local ternary search around the best integer bin.
     double refinedBin = bestBin;
-    int iBest = static_cast<int>(std::round(bestBin));
-    if (iBest > 0 && iBest < numBins_ - 1) {
-        double y0 = 0, y1 = bestScore, y2 = 0;
-        // Recompute neighbor scores for interpolation
-        for (int offset : {-1, 1}) {
-            double neighborBin = bestBin + offset * 0.5;
-            double neighborFreq = binToFreqHz(neighborBin);
-            double score = 0;
-            for (int h = 0; h < numHarmonics; h++) {
-                double harmonicFreq = neighborFreq * (h + 1);
-                if (harmonicFreq > freqs_[numBins_ - 1] * sampleRate_ * 0.95) break;
-                double harmonicBin = freqToBin(harmonicFreq);
-                score += interpolatedSpectrum(spectrum, harmonicBin) / maxAmp * harmonicWeights[h];
-            }
-            if (offset == -1) y0 = score / numHarmonics;
-            else y2 = score / numHarmonics;
-        }
-        // Parabolic interpolation: peak at x = i + (y0 - y2) / (2*(y0 - 2*y1 + y2))
-        double denom = 2.0 * (y0 - 2.0 * y1 + y2);
-        if (std::abs(denom) > 1e-10) {
-            double shift = (y0 - y2) / denom;
-            refinedBin = bestBin + std::clamp(shift, -0.5, 0.5);
+    double left = std::max(binMin, bestBin - 1.0);
+    double right = std::min(binMax, bestBin + 1.0);
+    for (int iter = 0; iter < 14; ++iter) {
+        const double m1 = left + (right - left) / 3.0;
+        const double m2 = right - (right - left) / 3.0;
+        const double s1 = scoreCandidateBin(m1);
+        const double s2 = scoreCandidateBin(m2);
+        if (s1 < s2) {
+            left = m1;
+        } else {
+            right = m2;
         }
     }
+    refinedBin = 0.5 * (left + right);
     
     double detectedFreq = binToFreqHz(refinedBin);
     

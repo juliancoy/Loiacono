@@ -125,6 +125,29 @@ target_compile_definitions(test_modes_headless PRIVATE
     LOIACONO_ENABLE_VULKAN_COMPUTE=$<BOOL:${LOIACONO_ENABLE_VULKAN_COMPUTE}>
 )
 
+add_executable(test_pitch_tuning_headless
+    tests/test_pitch_tuning_headless.cpp
+    loiacono_rolling.cpp
+    loiacono_parallel.cpp
+    loiacono_gpu_compute.cpp
+    loiacono_vulkan_compute.cpp
+    loiacono_gpu_rolling_compute.cpp
+)
+
+target_link_libraries(test_pitch_tuning_headless PRIVATE
+    Qt6::Core
+    Qt6::OpenGLWidgets
+    Vulkan::Vulkan
+)
+
+target_include_directories(test_pitch_tuning_headless PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rtaudio
+)
+target_compile_definitions(test_pitch_tuning_headless PRIVATE
+    LOIACONO_ENABLE_DESKTOP_AUDIO=$<BOOL:${LOIACONO_ENABLE_DESKTOP_AUDIO}>
+    LOIACONO_ENABLE_VULKAN_COMPUTE=$<BOOL:${LOIACONO_ENABLE_VULKAN_COMPUTE}>
+)
+
 # Display consistency test (generates images for comparison)
 add_executable(test_display_consistency
     audio_device_labels.cpp

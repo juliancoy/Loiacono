@@ -24,6 +24,9 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QSignalBlocker>
+#include <QCommandLineParser>
+#include <QTimer>
+#include <QElapsedTimer>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -39,6 +42,37 @@
 static constexpr const char* APP_ID = "com.loiacono.spectrogram";
 static constexpr quint16 API_PORT_START = 8080;
 static constexpr quint16 API_PORT_END = 8090;
+
+enum class SyntheticInputMode {
+    Off = 0,
+    Sine,
+    Sawtooth,
+    Square,
+};
+
+static SyntheticInputMode syntheticInputModeFromString(const QString& rawMode)
+{
+    const QString mode = rawMode.trimmed().toLower();
+    if (mode == "sine") return SyntheticInputMode::Sine;
+    if (mode == "saw" || mode == "sawtooth") return SyntheticInputMode::Sawtooth;
+    if (mode == "square") return SyntheticInputMode::Square;
+    return SyntheticInputMode::Off;
+}
+
+static QString syntheticInputModeName(SyntheticInputMode mode)
+{
+    switch (mode) {
+    case SyntheticInputMode::Sine:
+        return "sine";
+    case SyntheticInputMode::Sawtooth:
+        return "sawtooth";
+    case SyntheticInputMode::Square:
+        return "square";
+    case SyntheticInputMode::Off:
+    default:
+        return "off";
+    }
+}
 
 struct SavedUiState {
     int multiple = 40;
@@ -474,6 +508,62 @@ int main(int argc, char* argv[])
     app.setApplicationName("Loiacono Spectrogram");
     app.setOrganizationName("Loiacono");
     app.setStyle("Fusion");
+    const QString platformName = QGuiApplication::platformName().toLower();
+    const bool gpuDisplayAllowed = !(platformName.contains("offscreen")
+                                     || platformName.contains("minimal"));
+
+    QCommandLineParser cmdParser;
+    cmdParser.setApplicationDescription("Loiacono rolling spectrogram");
+    cmdParser.addHelpOption();
+    cmdParser.addVersionOption();
+    QCommandLineOption syntheticInputOption(
+        "synthetic-input",
+        "Synthetic input source: off|sine|sawtooth|square",
+        "mode",
+        "off");
+    QCommandLineOption syntheticFreqOption(
+        "synthetic-freq",
+        "Synthetic waveform frequency in Hz.",
+        "hz",
+        "220");
+    QCommandLineOption syntheticAmpOption(
+        "synthetic-amp",
+        "Synthetic waveform amplitude [0.0, 1.0].",
+        "amp",
+        "0.8");
+    cmdParser.addOption(syntheticInputOption);
+    cmdParser.addOption(syntheticFreqOption);
+    cmdParser.addOption(syntheticAmpOption);
+    cmdParser.process(app);
+
+    const QString syntheticModeRaw = cmdParser.value(syntheticInputOption);
+    const SyntheticInputMode syntheticMode = syntheticInputModeFromString(syntheticModeRaw);
+    const bool syntheticInputEnabled = syntheticMode != SyntheticInputMode::Off;
+    bool syntheticFreqOk = false;
+    bool syntheticAmpOk = false;
+    double syntheticFreqHz = cmdParser.value(syntheticFreqOption).toDouble(&syntheticFreqOk);
+    double syntheticAmp = cmdParser.value(syntheticAmpOption).toDouble(&syntheticAmpOk);
+    if (!syntheticFreqOk || !std::isfinite(syntheticFreqHz) || syntheticFreqHz <= 0.0) {
+        std::cerr << "Invalid --synthetic-freq value: "
+                  << cmdParser.value(syntheticFreqOption).toStdString() << "\n";
+        return 1;
+    }
+    if (!syntheticAmpOk || !std::isfinite(syntheticAmp)) {
+        std::cerr << "Invalid --synthetic-amp value: "
+                  << cmdParser.value(syntheticAmpOption).toStdString() << "\n";
+        return 1;
+    }
+    syntheticAmp = std::clamp(syntheticAmp, 0.0, 1.0);
+    if (syntheticModeRaw != "off"
+        && syntheticModeRaw != "sine"
+        && syntheticModeRaw != "saw"
+        && syntheticModeRaw != "sawtooth"
+        && syntheticModeRaw != "square") {
+        std::cerr << "Invalid --synthetic-input value: "
+                  << syntheticModeRaw.toStdString()
+                  << " (expected off|sine|sawtooth|square)\n";
+        return 1;
+    }
 
     // Dark palette
     QPalette pal;
@@ -489,6 +579,27 @@ int main(int argc, char* argv[])
     // Transform
     LoiaconoRolling transform;
     SavedUiState savedState = loadSavedUiState();
+    if (syntheticInputEnabled) {
+        // Deterministic, cleaner visualization preset for isolated synthetic runs.
+        savedState.multiple = 96;
+        savedState.bins = 1024;
+        savedState.freqMin = 40;
+        savedState.freqMax = 5000;
+        savedState.gainTenths = 12;
+        savedState.gammaHundredths = 90;
+        savedState.floorHundredths = 10;
+        savedState.displayTenths = 80;
+        savedState.modeIndex = 2; // Multi-thread + CPU display
+        savedState.temporalWeightingMode = static_cast<int>(LoiaconoRolling::WindowMode::HannWindow);
+        savedState.normalizationMode = static_cast<int>(LoiaconoRolling::NormalizationMode::Energy);
+        savedState.windowLengthMode = static_cast<int>(LoiaconoRolling::WindowLengthMode::PeriodMultiple);
+        savedState.algorithmMode = static_cast<int>(LoiaconoRolling::AlgorithmMode::Loiacono);
+        savedState.displayNormalizationMode = static_cast<int>(SpectrogramWidget::DisplayNormalizationMode::SmoothedGlobalMax);
+        savedState.toneCurveMode = static_cast<int>(SpectrogramWidget::ToneCurveMode::PowerGamma);
+        savedState.columnFillMode = static_cast<int>(SpectrogramWidget::ColumnFillMode::DuplicateSnapshot);
+        savedState.gridVisible = 1;
+        savedState.bufferEdgeMarkersVisible = 0;
+    }
     AudioSettings audioSettings;
     audioSettings.sampleRate = static_cast<unsigned int>(std::clamp(savedState.sampleRate, 8000, 192000));
     audioSettings.bufferFrames = static_cast<unsigned int>(std::clamp(savedState.bufferFrames, 16, 4096));
@@ -689,6 +800,12 @@ int main(int argc, char* argv[])
     addMode("Vulkan compute + CPU display", LoiaconoRolling::ComputeMode::VulkanCompute, false);
     addMode("Vulkan compute + GPU display", LoiaconoRolling::ComputeMode::VulkanCompute, true);
     modeCombo->setCurrentIndex(std::clamp(savedState.modeIndex, 0, modeCombo->count() - 1));
+    if (!gpuDisplayAllowed) {
+        const int packed = modeCombo->currentData().toInt();
+        if ((packed & 1) != 0) {
+            modeCombo->setCurrentIndex(std::max(0, modeCombo->currentIndex() - 1));
+        }
+    }
     temporalWeightingCombo->addItem("Rectangular", static_cast<int>(LoiaconoRolling::WindowMode::RectangularWindow));
     temporalWeightingCombo->addItem("Hann", static_cast<int>(LoiaconoRolling::WindowMode::HannWindow));
     temporalWeightingCombo->addItem("Hamming", static_cast<int>(LoiaconoRolling::WindowMode::HammingWindow));
@@ -945,6 +1062,7 @@ int main(int argc, char* argv[])
     };
 
     auto saveStateNow = [&]() {
+        if (syntheticInputEnabled) return;
         SavedUiState current;
         current.multiple = slMultiple->value();
         current.bins = slBins->value();
@@ -1063,10 +1181,13 @@ int main(int argc, char* argv[])
         slMax->setValue(std::clamp(newMax, slMax->minimum(), slMax->maximum()));
     });
 
-    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo, saveStateNow, updateActiveModeUi](int index) {
+    QObject::connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&transform, spectrogram, statusBar, modeCombo, saveStateNow, updateActiveModeUi, gpuDisplayAllowed](int index) {
         int packed = modeCombo->itemData(index).toInt();
         auto mode = static_cast<LoiaconoRolling::ComputeMode>(packed >> 1);
         bool gpuDisplay = (packed & 1) != 0;
+        if (!gpuDisplayAllowed) {
+            gpuDisplay = false;
+        }
         transform.setComputeMode(mode);
         spectrogram->setHardwareAccelerationEnabled(gpuDisplay);
 
@@ -1086,6 +1207,65 @@ int main(int argc, char* argv[])
 
     // ── Audio ──
     std::unique_ptr<RtAudio> adc;
+    QTimer syntheticTimer;
+    QElapsedTimer syntheticElapsed;
+    std::vector<float> syntheticChunk;
+    syntheticChunk.resize(std::max(16u, audioSettings.bufferFrames), 0.0f);
+    uint64_t syntheticSampleIndex = 0;
+    qint64 syntheticLastNs = 0;
+    double syntheticPendingSamples = 0.0;
+
+    constexpr double kTwoPi = 6.28318530717958647692;
+    auto pushSyntheticChunk = [&]() {
+        if (!syntheticInputEnabled) return;
+        if (!syntheticElapsed.isValid()) {
+            syntheticElapsed.start();
+            syntheticLastNs = syntheticElapsed.nsecsElapsed();
+        }
+        const qint64 nowNs = syntheticElapsed.nsecsElapsed();
+        const qint64 deltaNs = std::max<qint64>(0, nowNs - syntheticLastNs);
+        syntheticLastNs = nowNs;
+        syntheticPendingSamples += (static_cast<double>(deltaNs) * static_cast<double>(audioSettings.sampleRate)) / 1.0e9;
+        int frames = static_cast<int>(std::floor(syntheticPendingSamples));
+        if (frames < 1) frames = 1;
+        syntheticPendingSamples -= frames;
+
+        if (static_cast<int>(syntheticChunk.size()) != frames) {
+            syntheticChunk.resize(frames, 0.0f);
+        }
+        const double sampleRate = std::max(1.0, static_cast<double>(audioSettings.sampleRate));
+        for (int i = 0; i < frames; ++i) {
+            const double phase = std::fmod((static_cast<double>(syntheticSampleIndex++) * syntheticFreqHz) / sampleRate, 1.0);
+            double sample = 0.0;
+            switch (syntheticMode) {
+            case SyntheticInputMode::Sine:
+                sample = std::sin(phase * kTwoPi);
+                break;
+            case SyntheticInputMode::Sawtooth:
+                sample = (2.0 * phase) - 1.0;
+                break;
+            case SyntheticInputMode::Square:
+                sample = (phase < 0.5) ? 1.0 : -1.0;
+                break;
+            case SyntheticInputMode::Off:
+            default:
+                sample = 0.0;
+                break;
+            }
+            syntheticChunk[i] = static_cast<float>(sample * syntheticAmp);
+        }
+        transform.processChunk(syntheticChunk.data(), frames);
+    };
+    auto restartSyntheticTimer = [&]() {
+        if (!syntheticInputEnabled) return;
+        syntheticTimer.stop();
+        syntheticPendingSamples = 0.0;
+        syntheticElapsed.restart();
+        syntheticLastNs = syntheticElapsed.nsecsElapsed();
+        syntheticTimer.start(5);
+    };
+    QObject::connect(&syntheticTimer, &QTimer::timeout, [&]() { pushSyntheticChunk(); });
+
     auto populateDevices = [&]() {
         devCombo->clear();
         int selectIdx = -1;
@@ -1129,7 +1309,13 @@ int main(int argc, char* argv[])
         transform.configure(audioSettings.sampleRate, freqMin, freqMax, numBins, multiple);
         spectrogram->setAudioBufferFrames(audioSettings.bufferFrames);
         spectrogram->resetHistory();
-        if (devCombo->currentIndex() >= 0) {
+        if (syntheticInputEnabled) {
+            restartSyntheticTimer();
+            statusBar->showMessage(QString("Synthetic %1: %2 Hz @ %3 amp")
+                                       .arg(syntheticInputModeName(syntheticMode))
+                                       .arg(syntheticFreqHz, 0, 'f', 2)
+                                       .arg(syntheticAmp, 0, 'f', 2));
+        } else if (devCombo->currentIndex() >= 0) {
             RtAudio::Api api = RtAudio::UNSPECIFIED;
             unsigned int devId = 0;
             if (decodeDeviceKey(devCombo->currentData(), &api, &devId)) {
@@ -1143,6 +1329,7 @@ int main(int argc, char* argv[])
     };
 
     auto switchDevice = [&](int comboIdx) {
+        if (syntheticInputEnabled) return;
         if (comboIdx < 0) return;
         RtAudio::Api api = RtAudio::UNSPECIFIED;
         unsigned int devId = 0;
@@ -1234,7 +1421,13 @@ int main(int argc, char* argv[])
     updateToneCurveUi();
 
     // Open default device
-    if (devCombo->currentIndex() >= 0) {
+    if (syntheticInputEnabled) {
+        restartSyntheticTimer();
+        statusBar->showMessage(QString("Synthetic %1: %2 Hz @ %3 amp")
+                                   .arg(syntheticInputModeName(syntheticMode))
+                                   .arg(syntheticFreqHz, 0, 'f', 2)
+                                   .arg(syntheticAmp, 0, 'f', 2));
+    } else if (devCombo->currentIndex() >= 0) {
         RtAudio::Api api = RtAudio::UNSPECIFIED;
         unsigned int devId = 0;
         if (decodeDeviceKey(devCombo->currentData(), &api, &devId)) {
@@ -1306,6 +1499,7 @@ int main(int argc, char* argv[])
     paramsWindow->show();
     int ret = app.exec();
     saveStateNow();
+    syntheticTimer.stop();
     if (adc && adc->isStreamOpen()) adc->closeStream();
     return ret;
 }
