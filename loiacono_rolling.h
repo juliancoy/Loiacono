@@ -11,9 +11,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <complex>
-#include "loiacono_gpu_compute.h"
 #include "loiacono_vulkan_compute.h"
-#include "loiacono_gpu_rolling_compute.h"
 
 // Loiacono Transform - A sliding-window variation of the Goertzel algorithm
 // 
@@ -231,9 +229,7 @@ private:
     AlgorithmMode algorithmMode_ = AlgorithmMode::Loiacono;
     double leakiness_ = 0.99995;  // Default: 0.005% leakage per sample
     double baseAFreq_ = 440.0;    // Base A4 frequency for pitch detection
-    mutable std::unique_ptr<LoiaconoGpuCompute> gpuCompute_;
     mutable std::unique_ptr<LoiaconoVulkanCompute> vulkanCompute_;
-    mutable std::unique_ptr<LoiaconoGpuRollingCompute> gpuRollingCompute_;
     mutable std::unordered_map<int, std::vector<float>> cachedWindowWeights_;
     std::deque<GpuChunkDelta> pendingGpuChunks_;
     bool pendingGpuChunksOverflowed_ = false;

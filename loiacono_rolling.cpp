@@ -19,7 +19,6 @@
 // update per sample.
 
 #include "loiacono_rolling.h"
-#include "loiacono_gpu_compute.h"
 #include "loiacono_parallel.h"
 #include <algorithm>
 #include <array>
@@ -125,7 +124,7 @@ const char* LoiaconoRolling::normalizationModeName(NormalizationMode mode)
 
 bool LoiaconoRolling::gpuComputeAvailable() const
 {
-    return gpuCompute_ && gpuCompute_->available();
+    return vulkanCompute_ && vulkanCompute_->available();
 }
 
 bool LoiaconoRolling::vulkanComputeAvailable() const
@@ -205,27 +204,11 @@ const std::vector<float>& LoiaconoRolling::cachedWindowWeights(int wlen) const
 
 bool LoiaconoRolling::ensureGpuBackendsConfiguredLocked()
 {
-    if (!gpuCompute_) {
-        gpuCompute_ = std::make_unique<LoiaconoGpuCompute>();
-    }
-    if (!gpuRollingCompute_) {
-        gpuRollingCompute_ = std::make_unique<LoiaconoGpuRollingCompute>();
-    }
     if (!vulkanCompute_) {
         vulkanCompute_ = std::make_unique<LoiaconoVulkanCompute>();
     }
 
-    bool rollingOk = gpuRollingCompute_->configure(RING_SIZE, 2048, numBins_, freqs_, norms_, windowLens_);
     const int fftLength = fftWindowLengthForCurrentConfig();
-    bool computeOk = gpuCompute_->configure(RING_SIZE,
-                                            numBins_,
-                                            freqs_,
-                                            norms_,
-                                            windowLens_,
-                                            static_cast<int>(algorithmMode_),
-                                            static_cast<int>(windowMode_),
-                                            static_cast<int>(normalizationMode_),
-                                            fftLength);
     bool vulkanOk = vulkanCompute_->configure(RING_SIZE,
                                               numBins_,
                                               freqs_,
@@ -235,7 +218,7 @@ bool LoiaconoRolling::ensureGpuBackendsConfiguredLocked()
                                               static_cast<int>(windowMode_),
                                               static_cast<int>(normalizationMode_),
                                               fftLength);
-    return rollingOk || computeOk || vulkanOk;
+    return vulkanOk;
 }
 
 void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out) const
@@ -662,9 +645,8 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
                     pendingGpuChunksOverflowed_ = true;
                 }
             }
-            // GPU compute will be processed in the GUI thread via takePendingGpuChunks()
-            // Don't call gpuRollingCompute_->processChunk() here as it uses OpenGL
-            // from the audio thread which causes threading issues
+            // GPU compute is evaluated from snapshots so the audio thread never
+            // touches graphics-device state.
         } else if (mode == ComputeMode::SingleThread) {
             for (int i = 0; i < count; i++) {
                 processSample(samples[i]);
@@ -721,44 +703,12 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
         if (activeMode == ComputeMode::GpuCompute || activeMode == ComputeMode::VulkanCompute) {
             const unsigned int availableSamples = static_cast<unsigned int>(
                 std::min<uint64_t>(sampleCount_, static_cast<uint64_t>(RING_SIZE)));
-            if (activeMode == ComputeMode::VulkanCompute) {
-                if (vulkanCompute_ && vulkanCompute_->compute(ring_,
-                                                              static_cast<unsigned int>(ringHead_),
-                                                              availableSamples,
-                                                              leak,
-                                                              out)) {
-                    return;
-                }
-            } else {
-                if (gpuCompute_ && gpuCompute_->compute(ring_,
-                                                        static_cast<unsigned int>(ringHead_),
-                                                        availableSamples,
-                                                        leak,
-                                                        out)) {
-                    return;
-                }
-            }
-
-            if (usesRollingState() && !pendingGpuChunks_.empty() && gpuRollingCompute_ && gpuRollingCompute_->available()) {
-                auto& chunks = const_cast<std::deque<GpuChunkDelta>&>(pendingGpuChunks_);
-                auto& overflowed = const_cast<bool&>(pendingGpuChunksOverflowed_);
-
-                bool rollingOk = true;
-                while (!chunks.empty()) {
-                    const auto& delta = chunks.front();
-                    rollingOk = gpuRollingCompute_->processChunk(delta.newSamples.data(),
-                                                                 static_cast<int>(delta.newSamples.size()),
-                                                                 delta.startSampleCount,
-                                                                 delta.ringHeadStart,
-                                                                 leak);
-                    chunks.pop_front();
-                    if (!rollingOk) break;
-                }
-                overflowed = false;
-
-                if (rollingOk && gpuRollingCompute_->spectrum(out)) {
-                    return;
-                }
+            if (vulkanCompute_ && vulkanCompute_->compute(ring_,
+                                                          static_cast<unsigned int>(ringHead_),
+                                                          availableSamples,
+                                                          leak,
+                                                          out)) {
+                return;
             }
         }
         
