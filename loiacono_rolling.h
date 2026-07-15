@@ -69,6 +69,7 @@ public:
     void processSample(float sample);
     void processChunk(const float* samples, int count);
     void getSpectrum(std::vector<float>& out) const;
+    void getPhase(std::vector<float>& out) const;
     void getSpectraAtSampleCounts(const std::vector<uint64_t>& sampleCounts,
                                   std::vector<std::vector<float>>& out) const;
 
@@ -116,6 +117,8 @@ public:
     WindowLengthMode windowLengthMode() const { return windowLengthMode_; }
     void setAlgorithmMode(AlgorithmMode mode) { algorithmMode_ = mode; }
     AlgorithmMode algorithmMode() const { return algorithmMode_; }
+    void setPhaseCalculationEnabled(bool enabled);
+    bool phaseCalculationEnabled() const;
     
     // Leakiness factor: 1.0 = no leakage, 0.9999 = 0.01% leakage per sample
     void setLeakiness(double leak) { leakiness_ = std::clamp(leak, 0.99, 1.0); }
@@ -186,11 +189,11 @@ private:
     };
 
     bool ensureGpuBackendsConfiguredLocked();
-    void computeSpectrumFromRingLocked(std::vector<float>& out) const;
-    void computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
-    void computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
-    void computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
-    void computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const;
+    void computeSpectrumFromRingLocked(std::vector<float>& out, std::vector<float>* phaseOut = nullptr) const;
+    void computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut = nullptr) const;
+    void computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut = nullptr) const;
+    void computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut = nullptr) const;
+    void computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut = nullptr) const;
     int fftWindowLengthForCurrentConfig() const;
     std::vector<double> fftWindowWeights(int wlen) const;
     void fftInPlace(std::vector<std::complex<double>>& data) const;
@@ -208,6 +211,11 @@ private:
     std::vector<int>    windowLens_;
     std::vector<double> norms_;
     std::vector<double> Tr_, Ti_;
+    // Per-bin oscillators used by processSample(). Advancing a unit complex
+    // value is much cheaper than evaluating sin/cos for every bin and sample.
+    std::vector<double> phaseCos_, phaseSin_;
+    std::vector<double> phaseStepCos_, phaseStepSin_;
+    std::vector<double> windowPhaseCos_, windowPhaseSin_;
 
     static constexpr int RING_SIZE = 1 << 15;
     std::vector<float> ring_;
@@ -231,8 +239,10 @@ private:
     double baseAFreq_ = 440.0;    // Base A4 frequency for pitch detection
     mutable std::unique_ptr<LoiaconoVulkanCompute> vulkanCompute_;
     mutable std::unordered_map<int, std::vector<float>> cachedWindowWeights_;
+    mutable std::vector<float> phase_;
     std::deque<GpuChunkDelta> pendingGpuChunks_;
     bool pendingGpuChunksOverflowed_ = false;
+    bool phaseCalculationEnabled_ = false;
     static constexpr size_t MAX_PENDING_GPU_CHUNKS = 1024;
 
     mutable std::mutex mutex_;

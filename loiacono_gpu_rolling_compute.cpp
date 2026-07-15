@@ -91,6 +91,7 @@ const char* kMagnitudeShader = R"(
     layout(std430, binding = 0) readonly buffer TrBuf { float trState[]; };
     layout(std430, binding = 1) readonly buffer TiBuf { float tiState[]; };
     layout(std430, binding = 2) writeonly buffer MagBuf { float magnitude[]; };
+    layout(std430, binding = 3) writeonly buffer PhaseBuf { float phaseOut[]; };
 
     uniform int numBins;
 
@@ -101,6 +102,7 @@ const char* kMagnitudeShader = R"(
         float tr = trState[idx];
         float ti = tiState[idx];
         magnitude[idx] = sqrt(tr * tr + ti * ti);
+        phaseOut[idx] = atan(ti, tr);
     }
 )";
 }
@@ -210,7 +212,7 @@ public:
         return true;
     }
 
-    bool spectrum(std::vector<float>& outSpectrum) const
+    bool spectrum(std::vector<float>& outSpectrum, std::vector<float>* outPhase) const
     {
         if (!initialized_ || numBins_ <= 0) return false;
         
@@ -232,6 +234,7 @@ public:
         bindBufferBase(f, 0, buffers_[5]);
         bindBufferBase(f, 1, buffers_[6]);
         bindBufferBase(f, 2, buffers_[7]);
+        bindBufferBase(f, 3, buffers_[8]);
         f->glUniform1i(f->glGetUniformLocation(magnitudeProgram_, "numBins"), numBins_);
         f->glDispatchCompute(static_cast<GLuint>((numBins_ + kThreadsPerGroup - 1) / kThreadsPerGroup), 1, 1);
         f->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
@@ -248,12 +251,27 @@ public:
         }
         std::memcpy(outSpectrum.data(), mapped, numBins_ * sizeof(float));
         f->glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+
+        if (outPhase) {
+            outPhase->resize(numBins_);
+            f->glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffers_[8]);
+            void* mappedPhase = f->glMapBufferRange(GL_SHADER_STORAGE_BUFFER,
+                                                    0,
+                                                    numBins_ * static_cast<int>(sizeof(float)),
+                                                    GL_MAP_READ_BIT);
+            if (!mappedPhase) {
+                context_->doneCurrent();
+                return false;
+            }
+            std::memcpy(outPhase->data(), mappedPhase, numBins_ * sizeof(float));
+            f->glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        }
         context_->doneCurrent();
         return true;
     }
 
 private:
-    static constexpr int kBufferCount = 8;
+    static constexpr int kBufferCount = 9;
 
     bool ensureContext() const
     {
@@ -341,6 +359,7 @@ private:
         bindBufferData(f, buffers_[5], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
         bindBufferData(f, buffers_[6], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
         bindBufferData(f, buffers_[7], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
+        bindBufferData(f, buffers_[8], std::max(1, numBins) * static_cast<int>(sizeof(float)), nullptr, GL_DYNAMIC_DRAW);
 
         std::vector<float> zeros(std::max(1, numBins), 0.0f);
         std::vector<float> zeroRing(std::max(1, signalLength), 0.0f);
@@ -390,7 +409,7 @@ private:
     mutable std::unique_ptr<QOpenGLContext> context_;
     mutable GLuint updateProgram_ = 0;
     mutable GLuint magnitudeProgram_ = 0;
-    mutable GLuint buffers_[kBufferCount] = {0, 0, 0, 0, 0, 0, 0, 0};
+    mutable GLuint buffers_[kBufferCount] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     mutable bool buffersInitialized_ = false;
     bool initialized_ = false;
     mutable bool needsReconfigure_ = false;
@@ -436,7 +455,7 @@ bool LoiaconoGpuRollingCompute::processChunk(const float* newSamples,
     return impl_->processChunk(newSamples, count, startSampleCount, ringHeadStart, leakiness);
 }
 
-bool LoiaconoGpuRollingCompute::spectrum(std::vector<float>& outSpectrum) const
+bool LoiaconoGpuRollingCompute::spectrum(std::vector<float>& outSpectrum, std::vector<float>* outPhase) const
 {
-    return impl_->spectrum(outSpectrum);
+    return impl_->spectrum(outSpectrum, outPhase);
 }

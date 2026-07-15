@@ -21,7 +21,7 @@ public:
                       std::uint64_t startSampleCount,
                       int ringHeadStart,
                       double leakiness = 1.0);
-    bool spectrum(std::vector<float>& outSpectrum) const;
+    bool spectrum(std::vector<float>& outSpectrum, std::vector<float>* outPhase = nullptr) const;
 
 private:
     class Impl;

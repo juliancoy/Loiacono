@@ -35,6 +35,7 @@ void main()
     int validSamples = min(fftLen, int(min(params[1], uint(SIGNAL_LENGTH))));
     if (validSamples <= 0) {
         L[frequencyIx] = 0.0;
+        P[frequencyIx] = 0.0;
         return;
     }
 
@@ -70,7 +71,12 @@ void main()
     }
 
     float normScale = normalizationScale(normalizationMode, weightSum, weightEnergy);
-    float mag0 = sqrt(real0 * real0 + imag0 * imag0) * normScale;
-    float mag1 = sqrt(real1 * real1 + imag1 * imag1) * normScale;
-    L[frequencyIx] = mix(mag0, mag1, frac);
+    real0 *= normScale;
+    imag0 *= normScale;
+    real1 *= normScale;
+    imag1 *= normScale;
+    float realMix = mix(real0, real1, frac);
+    float imagMix = mix(imag0, imag1, frac);
+    L[frequencyIx] = sqrt(realMix * realMix + imagMix * imagMix);
+    P[frequencyIx] = atan(imagMix, realMix);
 }

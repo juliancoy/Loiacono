@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -21,8 +22,10 @@ public:
     bool compute(const std::vector<float>& ring,
                  unsigned int offset,
                  unsigned int availableSamples,
+                 std::uint64_t sampleCount,
                  float leakiness,
-                 std::vector<float>& outSpectrum);
+                 std::vector<float>& outSpectrum,
+                 std::vector<float>* outPhase = nullptr);
 
 private:
     class Impl;

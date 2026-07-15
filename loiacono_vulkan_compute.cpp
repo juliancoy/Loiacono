@@ -67,10 +67,11 @@ QString buildShaderSource(int signalLength, int algorithmMode)
     const QString buffers =
         "layout(std430, set = 0, binding = 0) buffer x_buf { readonly float x[SIGNAL_LENGTH]; };\n"
         "layout(std430, set = 0, binding = 1) buffer L_buf { writeonly float L[]; };\n"
-        "layout(std430, set = 0, binding = 2) buffer f_buf { readonly float f[]; };\n"
-        "layout(std430, set = 0, binding = 3) buffer norm_buf { readonly float norm[]; };\n"
-        "layout(std430, set = 0, binding = 4) buffer window_buf { readonly int windowLen[]; };\n"
-        "layout(std430, set = 0, binding = 5) buffer params_buf { readonly uint params[16]; };\n";
+        "layout(std430, set = 0, binding = 2) buffer P_buf { writeonly float P[]; };\n"
+        "layout(std430, set = 0, binding = 3) buffer f_buf { readonly float f[]; };\n"
+        "layout(std430, set = 0, binding = 4) buffer norm_buf { readonly float norm[]; };\n"
+        "layout(std430, set = 0, binding = 5) buffer window_buf { readonly int windowLen[]; };\n"
+        "layout(std430, set = 0, binding = 6) buffer params_buf { readonly uint params[16]; };\n";
 
     source.replace("DEFINE_STRING", defines);
     source.replace("BUFFERS_STRING", buffers);
@@ -148,8 +149,10 @@ public:
     bool compute(const std::vector<float>& ring,
                  unsigned int offset,
                  unsigned int availableSamples,
+                 std::uint64_t sampleCount,
                  float leakiness,
-                 std::vector<float>& outSpectrum)
+                 std::vector<float>& outSpectrum,
+                 std::vector<float>* outPhase)
     {
         if (!initialized_ || ring.size() != static_cast<size_t>(signalLength_)) return false;
 
@@ -160,12 +163,17 @@ public:
         params[2] = static_cast<uint32_t>(std::max(2, fftLength_));
         params[3] = static_cast<uint32_t>(std::max(0, windowMode_));
         params[4] = static_cast<uint32_t>(std::max(0, normalizationMode_));
+        params[6] = static_cast<uint32_t>(sampleCount & 0xffffffffu);
         std::memcpy(paramsBuffer_.mapped, params.data(), sizeof(params));
 
         if (!recordAndSubmit(leakiness)) return false;
 
         outSpectrum.resize(static_cast<size_t>(numBins_));
         std::memcpy(outSpectrum.data(), outputBuffer_.mapped, static_cast<size_t>(numBins_) * sizeof(float));
+        if (outPhase) {
+            outPhase->resize(static_cast<size_t>(numBins_));
+            std::memcpy(outPhase->data(), phaseBuffer_.mapped, static_cast<size_t>(numBins_) * sizeof(float));
+        }
         return true;
     }
 
@@ -257,7 +265,7 @@ private:
         shaderInfo.pCode = reinterpret_cast<const uint32_t*>(spirv.constData());
         if (!check(vkCreateShaderModule(device_, &shaderInfo, nullptr, &shaderModule_))) return false;
 
-        std::array<VkDescriptorSetLayoutBinding, 6> bindings{};
+        std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
         for (uint32_t i = 0; i < bindings.size(); ++i) {
             bindings[static_cast<size_t>(i)].binding = i;
             bindings[static_cast<size_t>(i)].descriptorCount = 1;
@@ -298,7 +306,7 @@ private:
 
         std::array<VkDescriptorPoolSize, 1> poolSizes{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[0].descriptorCount = 6;
+        poolSizes[0].descriptorCount = 7;
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         poolInfo.maxSets = 1;
@@ -326,14 +334,15 @@ private:
 
         if (!createBuffer(signalLength * sizeof(float), signalBuffer_)) return false;
         if (!createBuffer(std::max(1, numBins) * static_cast<int>(sizeof(float)), outputBuffer_)) return false;
+        if (!createBuffer(std::max(1, numBins) * static_cast<int>(sizeof(float)), phaseBuffer_)) return false;
         if (!createBuffer(std::max(1, numBins) * static_cast<int>(sizeof(float)), freqBuffer_)) return false;
         if (!createBuffer(std::max(1, numBins) * static_cast<int>(sizeof(float)), normBuffer_)) return false;
         if (!createBuffer(std::max(1, numBins) * static_cast<int>(sizeof(int)), windowBuffer_)) return false;
         if (!createBuffer(16 * sizeof(uint32_t), paramsBuffer_)) return false;
 
-        std::array<VkWriteDescriptorSet, 6> writes{};
-        std::array<VkDescriptorBufferInfo, 6> infos{};
-        const Buffer* buffers[] = {&signalBuffer_, &outputBuffer_, &freqBuffer_, &normBuffer_, &windowBuffer_, &paramsBuffer_};
+        std::array<VkWriteDescriptorSet, 7> writes{};
+        std::array<VkDescriptorBufferInfo, 7> infos{};
+        const Buffer* buffers[] = {&signalBuffer_, &outputBuffer_, &phaseBuffer_, &freqBuffer_, &normBuffer_, &windowBuffer_, &paramsBuffer_};
         for (uint32_t i = 0; i < infos.size(); ++i) {
             infos[static_cast<size_t>(i)].buffer = buffers[i]->buffer;
             infos[static_cast<size_t>(i)].offset = 0;
@@ -372,12 +381,16 @@ private:
         barrier.buffer = outputBuffer_.buffer;
         barrier.offset = 0;
         barrier.size = outputBuffer_.size;
+        VkBufferMemoryBarrier phaseBarrier = barrier;
+        phaseBarrier.buffer = phaseBuffer_.buffer;
+        phaseBarrier.size = phaseBuffer_.size;
+        std::array<VkBufferMemoryBarrier, 2> barriers{barrier, phaseBarrier};
         vkCmdPipelineBarrier(commandBuffer_,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_HOST_BIT,
                              0,
                              0, nullptr,
-                             1, &barrier,
+                             static_cast<uint32_t>(barriers.size()), barriers.data(),
                              0, nullptr);
 
         if (!check(vkEndCommandBuffer(commandBuffer_))) return false;
@@ -473,6 +486,7 @@ private:
     {
         destroyBuffer(signalBuffer_);
         destroyBuffer(outputBuffer_);
+        destroyBuffer(phaseBuffer_);
         destroyBuffer(freqBuffer_);
         destroyBuffer(normBuffer_);
         destroyBuffer(windowBuffer_);
@@ -545,6 +559,7 @@ private:
 
     Buffer signalBuffer_;
     Buffer outputBuffer_;
+    Buffer phaseBuffer_;
     Buffer freqBuffer_;
     Buffer normBuffer_;
     Buffer windowBuffer_;
@@ -595,8 +610,10 @@ bool LoiaconoVulkanCompute::configure(int signalLength,
 bool LoiaconoVulkanCompute::compute(const std::vector<float>& ring,
                                     unsigned int offset,
                                     unsigned int availableSamples,
+                                    std::uint64_t sampleCount,
                                     float leakiness,
-                                    std::vector<float>& outSpectrum)
+                                    std::vector<float>& outSpectrum,
+                                    std::vector<float>* outPhase)
 {
-    return impl_->compute(ring, offset, availableSamples, leakiness, outSpectrum);
+    return impl_->compute(ring, offset, availableSamples, sampleCount, leakiness, outSpectrum, outPhase);
 }

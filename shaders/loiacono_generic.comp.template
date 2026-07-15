@@ -28,11 +28,15 @@ void main()
     if (validSamples <= 0) {
         if (threadIx == 0u) {
             L[frequencyIx] = 0.0;
+            P[frequencyIx] = 0.0;
         }
         return;
     }
 
     uint ringStart = (params[0] + uint(SIGNAL_LENGTH - validSamples)) % uint(SIGNAL_LENGTH);
+    uint startSample = params[6] >= uint(validSamples)
+        ? (params[6] - uint(validSamples))
+        : 0u;
     float freq = f[frequencyIx];
     float scale = norm[frequencyIx];
     int windowMode = int(params[3]);
@@ -45,7 +49,7 @@ void main()
         float weight = windowMode == 5
             ? pow(LEAKINESS_VALUE, float(validSamples - 1 - k))
             : windowWeight(windowMode, k, validSamples);
-        float angle = 2.0 * PI * freq * float(k);
+        float angle = 2.0 * PI * freq * float(startSample + uint(k));
         tr += sampleValue * cos(angle) * scale * weight;
         ti -= sampleValue * sin(angle) * scale * weight;
     }
@@ -63,6 +67,9 @@ void main()
     }
 
     if (threadIx == 0u) {
-        L[frequencyIx] = sqrt(sharedTr[0] * sharedTr[0] + sharedTi[0] * sharedTi[0]);
+        float tr = sharedTr[0];
+        float ti = sharedTi[0];
+        L[frequencyIx] = sqrt(tr * tr + ti * ti);
+        P[frequencyIx] = atan(ti, tr);
     }
 }

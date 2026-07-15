@@ -38,6 +38,23 @@ void LoiaconoRolling::setComputeMode(ComputeMode mode)
     }
 }
 
+void LoiaconoRolling::setPhaseCalculationEnabled(bool enabled)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    phaseCalculationEnabled_ = enabled;
+    if (!enabled) {
+        phase_.clear();
+    } else if (numBins_ > 0) {
+        phase_.assign(static_cast<size_t>(numBins_), 0.0f);
+    }
+}
+
+bool LoiaconoRolling::phaseCalculationEnabled() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return phaseCalculationEnabled_;
+}
+
 LoiaconoRolling::ComputeMode LoiaconoRolling::activeComputeMode() const
 {
     if (computeMode_ == ComputeMode::GpuCompute && !gpuComputeAvailable()) {
@@ -221,7 +238,7 @@ bool LoiaconoRolling::ensureGpuBackendsConfiguredLocked()
     return vulkanOk;
 }
 
-void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out) const
+void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out, std::vector<float>* phaseOut) const
 {
     SpectrumSnapshot snapshot;
     snapshot.ring = ring_;
@@ -233,26 +250,27 @@ void LoiaconoRolling::computeSpectrumFromRingLocked(std::vector<float>& out) con
     snapshot.windowMode = windowMode_;
     snapshot.algorithmMode = algorithmMode_;
     snapshot.leakiness = effectiveLeakiness();
-    computeSpectrumFromSnapshot(snapshot, out);
+    computeSpectrumFromSnapshot(snapshot, out, phaseOut);
 }
 
-void LoiaconoRolling::computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+void LoiaconoRolling::computeSpectrumFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut) const
 {
+    if (phaseOut) phaseOut->assign(snapshot.freqs.size(), 0.0f);
     switch (snapshot.algorithmMode) {
     case AlgorithmMode::Loiacono:
-        computeSpectrumLoiaconoFromSnapshot(snapshot, out);
+        computeSpectrumLoiaconoFromSnapshot(snapshot, out, phaseOut);
         return;
     case AlgorithmMode::FFT:
-        computeSpectrumFftFromSnapshot(snapshot, out);
+        computeSpectrumFftFromSnapshot(snapshot, out, phaseOut);
         return;
     case AlgorithmMode::Goertzel:
-        computeSpectrumGoertzelFromSnapshot(snapshot, out);
+        computeSpectrumGoertzelFromSnapshot(snapshot, out, phaseOut);
         return;
     }
     out.assign(snapshot.freqs.size(), 0.0f);
 }
 
-void LoiaconoRolling::computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+void LoiaconoRolling::computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut) const
 {
     const int numBins = static_cast<int>(snapshot.freqs.size());
     out.resize(numBins);
@@ -307,6 +325,9 @@ void LoiaconoRolling::computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot
                 cosAngle = nextCos;
             }
             out[fi] = static_cast<float>(std::sqrt(tr * tr + ti * ti));
+            if (phaseOut) {
+                (*phaseOut)[static_cast<size_t>(fi)] = static_cast<float>(std::atan2(ti, tr));
+            }
         }
     };
 
@@ -330,7 +351,7 @@ void LoiaconoRolling::computeSpectrumLoiaconoFromSnapshot(const SpectrumSnapshot
     }
 }
 
-void LoiaconoRolling::computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+void LoiaconoRolling::computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut) const
 {
     const int numBins = static_cast<int>(snapshot.freqs.size());
     out.resize(numBins);
@@ -379,6 +400,9 @@ void LoiaconoRolling::computeSpectrumGoertzelFromSnapshot(const SpectrumSnapshot
             const double real = q1 - q2 * std::cos(omega);
             const double imag = q2 * std::sin(omega);
             out[fi] = static_cast<float>(std::sqrt(real * real + imag * imag) * norm);
+            if (phaseOut) {
+                (*phaseOut)[static_cast<size_t>(fi)] = static_cast<float>(std::atan2(imag, real));
+            }
         }
     };
 
@@ -452,7 +476,7 @@ void LoiaconoRolling::fftInPlace(std::vector<std::complex<double>>& data) const
     }
 }
 
-void LoiaconoRolling::computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out) const
+void LoiaconoRolling::computeSpectrumFftFromSnapshot(const SpectrumSnapshot& snapshot, std::vector<float>& out, std::vector<float>* phaseOut) const
 {
     const int numBins = static_cast<int>(snapshot.freqs.size());
     out.assign(numBins, 0.0f);
@@ -472,23 +496,31 @@ void LoiaconoRolling::computeSpectrumFftFromSnapshot(const SpectrumSnapshot& sna
     fftInPlace(data);
 
     const int nyquist = fftLen / 2;
-    std::vector<double> magnitudes(static_cast<size_t>(nyquist + 1), 0.0);
-    for (int i = 0; i <= nyquist; ++i) {
-        magnitudes[static_cast<size_t>(i)] = std::abs(data[static_cast<size_t>(i)]) * fftNorm;
-    }
-
     for (int fi = 0; fi < numBins; ++fi) {
         const double targetIndex = snapshot.freqs[fi] * fftLen;
         if (targetIndex <= 0.0) {
-            out[fi] = static_cast<float>(magnitudes.front());
+            const auto c = data.front() * fftNorm;
+            out[fi] = static_cast<float>(std::abs(c));
+            if (phaseOut) {
+                (*phaseOut)[static_cast<size_t>(fi)] = static_cast<float>(std::atan2(c.imag(), c.real()));
+            }
         } else if (targetIndex >= nyquist) {
-            out[fi] = static_cast<float>(magnitudes.back());
+            const auto c = data[static_cast<size_t>(nyquist)] * fftNorm;
+            out[fi] = static_cast<float>(std::abs(c));
+            if (phaseOut) {
+                (*phaseOut)[static_cast<size_t>(fi)] = static_cast<float>(std::atan2(c.imag(), c.real()));
+            }
         } else {
             const int i0 = static_cast<int>(std::floor(targetIndex));
             const int i1 = std::min(nyquist, i0 + 1);
             const double frac = targetIndex - static_cast<double>(i0);
-            out[fi] = static_cast<float>(magnitudes[static_cast<size_t>(i0)] * (1.0 - frac)
-                + magnitudes[static_cast<size_t>(i1)] * frac);
+            const std::complex<double> c0 = data[static_cast<size_t>(i0)] * fftNorm;
+            const std::complex<double> c1 = data[static_cast<size_t>(i1)] * fftNorm;
+            const std::complex<double> c = c0 * (1.0 - frac) + c1 * frac;
+            out[fi] = static_cast<float>(std::abs(c));
+            if (phaseOut) {
+                (*phaseOut)[static_cast<size_t>(fi)] = static_cast<float>(std::atan2(c.imag(), c.real()));
+            }
         }
     }
 }
@@ -561,12 +593,27 @@ void LoiaconoRolling::configure(double sampleRate, double freqMin, double freqMa
 
     Tr_.assign(numBins, 0.0);
     Ti_.assign(numBins, 0.0);
+    phaseCos_.assign(numBins, 1.0);
+    phaseSin_.assign(numBins, 0.0);
+    phaseStepCos_.resize(numBins);
+    phaseStepSin_.resize(numBins);
+    windowPhaseCos_.resize(numBins);
+    windowPhaseSin_.resize(numBins);
+    for (int i = 0; i < numBins; ++i) {
+        const double step = TWO_PI * freqs_[i];
+        phaseStepCos_[i] = std::cos(step);
+        phaseStepSin_[i] = std::sin(step);
+        const double windowPhase = step * static_cast<double>(windowLens_[i]);
+        windowPhaseCos_[i] = std::cos(windowPhase);
+        windowPhaseSin_[i] = std::sin(windowPhase);
+    }
     ring_.assign(RING_SIZE, 0.0f);
     ringHead_ = 0;
     sampleCount_ = 0;
     pendingGpuChunks_.clear();
     pendingGpuChunksOverflowed_ = false;
     cachedWindowWeights_.clear();
+    phase_.assign(static_cast<size_t>(std::max(0, numBins_)), 0.0f);
 
     if (computeMode_ == ComputeMode::GpuCompute || computeMode_ == ComputeMode::VulkanCompute) {
         ensureGpuBackendsConfiguredLocked();
@@ -580,7 +627,6 @@ void LoiaconoRolling::processSample(float sample)
     ring_[ringHead_] = sample;
 
     for (int fi = 0; fi < numBins_; fi++) {
-        double f = freqs_[fi];
         double norm = norms_[fi];
         int wlen = windowLens_[fi];
 
@@ -600,17 +646,35 @@ void LoiaconoRolling::processSample(float sample)
         // Our implementation uses a direct complex accumulation:
         //   Tr += x[n] * cos(2πf*n) * norm  (real part with amplitude scaling)
         //   Ti -= x[n] * sin(2πf*n) * norm  (imaginary part with amplitude scaling)
-        double angle = TWO_PI * f * static_cast<double>(sampleCount_);
-        Tr_[fi] += sample * std::cos(angle) * norm;
-        Ti_[fi] -= sample * std::sin(angle) * norm;
+        const double phaseCos = phaseCos_[fi];
+        const double phaseSin = phaseSin_[fi];
+        Tr_[fi] += sample * phaseCos * norm;
+        Ti_[fi] -= sample * phaseSin * norm;
 
         // Rolling window: subtract the sample that just left the window
         if (sampleCount_ >= static_cast<uint64_t>(wlen)) {
             int oldIdx = (ringHead_ - wlen + RING_SIZE) % RING_SIZE;
             float oldSample = (oldIdx == ringHead_) ? overwrittenSample : ring_[oldIdx];
-            double oldAngle = TWO_PI * f * static_cast<double>(sampleCount_ - wlen);
-            Tr_[fi] -= oldSample * std::cos(oldAngle) * norm;
-            Ti_[fi] += oldSample * std::sin(oldAngle) * norm;
+            // phase(n - wlen) = phase(n) * exp(-j * step * wlen).
+            const double oldPhaseCos = phaseCos * windowPhaseCos_[fi]
+                + phaseSin * windowPhaseSin_[fi];
+            const double oldPhaseSin = phaseSin * windowPhaseCos_[fi]
+                - phaseCos * windowPhaseSin_[fi];
+            Tr_[fi] -= oldSample * oldPhaseCos * norm;
+            Ti_[fi] += oldSample * oldPhaseSin * norm;
+        }
+
+        phaseCos_[fi] = phaseCos * phaseStepCos_[fi] - phaseSin * phaseStepSin_[fi];
+        phaseSin_[fi] = phaseSin * phaseStepCos_[fi] + phaseCos * phaseStepSin_[fi];
+
+        // Floating-point complex multiplication drifts very slowly away from
+        // the unit circle. Correct it outside almost all callback iterations.
+        if ((sampleCount_ & 4095u) == 4095u) {
+            const double magnitude = std::hypot(phaseCos_[fi], phaseSin_[fi]);
+            if (magnitude > 0.0) {
+                phaseCos_[fi] /= magnitude;
+                phaseSin_[fi] /= magnitude;
+            }
         }
     }
 
@@ -695,19 +759,26 @@ void LoiaconoRolling::processChunk(const float* samples, int count)
 void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
 {
     SpectrumSnapshot snapshot;
+    bool computePhase = false;
+    std::vector<float> phaseLocal;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        computePhase = phaseCalculationEnabled_;
         const float leak = static_cast<float>(effectiveLeakiness());
         
         const auto activeMode = activeComputeMode();
         if (activeMode == ComputeMode::GpuCompute || activeMode == ComputeMode::VulkanCompute) {
             const unsigned int availableSamples = static_cast<unsigned int>(
                 std::min<uint64_t>(sampleCount_, static_cast<uint64_t>(RING_SIZE)));
+            // Upstream maps both legacy GPU modes to the Vulkan backend.
             if (vulkanCompute_ && vulkanCompute_->compute(ring_,
                                                           static_cast<unsigned int>(ringHead_),
                                                           availableSamples,
+                                                          sampleCount_,
                                                           leak,
-                                                          out)) {
+                                                          out,
+                                                          computePhase ? &phaseLocal : nullptr)) {
+                if (computePhase) phase_ = phaseLocal;
                 return;
             }
         }
@@ -729,14 +800,34 @@ void LoiaconoRolling::getSpectrum(std::vector<float>& out) const
             }
         } else {
             out.resize(numBins_);
+            if (computePhase) phase_.resize(static_cast<size_t>(numBins_), 0.0f);
             for (int i = 0; i < numBins_; i++) {
                 out[i] = static_cast<float>(std::sqrt(Tr_[i] * Tr_[i] + Ti_[i] * Ti_[i]));
+                if (computePhase) {
+                    phase_[static_cast<size_t>(i)] = static_cast<float>(std::atan2(Ti_[i], Tr_[i]));
+                }
             }
             return;
         }
     }
 
-    computeSpectrumFromSnapshot(snapshot, out);
+    if (computePhase) {
+        computeSpectrumFromSnapshot(snapshot, out, &phaseLocal);
+        std::lock_guard<std::mutex> lock(mutex_);
+        phase_ = std::move(phaseLocal);
+    } else {
+        computeSpectrumFromSnapshot(snapshot, out, nullptr);
+    }
+}
+
+void LoiaconoRolling::getPhase(std::vector<float>& out) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_.size() == static_cast<size_t>(std::max(0, numBins_))) {
+        out = phase_;
+        return;
+    }
+    out.assign(static_cast<size_t>(std::max(0, numBins_)), 0.0f);
 }
 
 void LoiaconoRolling::getSpectraAtSampleCounts(const std::vector<uint64_t>& sampleCounts,

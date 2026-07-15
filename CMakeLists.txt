@@ -26,6 +26,7 @@ add_executable(loiacono_spectrogram
     loiacono_vulkan_compute.cpp
     loiacono_gpu_rolling_compute.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
     spectrogram_widget.cpp
     api_server.cpp
@@ -55,6 +56,7 @@ add_executable(test_cpp_consistency
     loiacono_vulkan_compute.cpp
     loiacono_gpu_rolling_compute.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
 )
 
@@ -81,6 +83,7 @@ add_executable(test_simple_consistency
     loiacono_vulkan_compute.cpp
     loiacono_gpu_rolling_compute.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
 )
 
@@ -105,6 +108,7 @@ add_executable(test_modes_headless
     audio_device_labels.cpp
     tests/test_modes_headless.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
     loiacono_gpu_compute.cpp
     loiacono_vulkan_compute.cpp
@@ -128,6 +132,7 @@ target_compile_definitions(test_modes_headless PRIVATE
 add_executable(test_pitch_tuning_headless
     tests/test_pitch_tuning_headless.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
     loiacono_gpu_compute.cpp
     loiacono_vulkan_compute.cpp
@@ -153,6 +158,7 @@ add_executable(test_display_consistency
     audio_device_labels.cpp
     tests/test_display_consistency.cpp
     loiacono_rolling.cpp
+    loiacono_pitch_shift.cpp
     loiacono_parallel.cpp
     loiacono_gpu_compute.cpp
     loiacono_vulkan_compute.cpp

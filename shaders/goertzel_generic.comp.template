@@ -27,6 +27,7 @@ void main()
     int validSamples = min(windowLen[frequencyIx], int(min(params[1], uint(SIGNAL_LENGTH))));
     if (validSamples <= 0) {
         L[frequencyIx] = 0.0;
+        P[frequencyIx] = 0.0;
         return;
     }
 
@@ -52,4 +53,5 @@ void main()
     float realPart = q1 - q2 * cos(omega);
     float imagPart = q2 * sin(omega);
     L[frequencyIx] = sqrt(realPart * realPart + imagPart * imagPart) * norm[frequencyIx];
+    P[frequencyIx] = atan(imagPart, realPart);
 }
