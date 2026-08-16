@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.24)
 project(LoiaconoSpectrogram LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -7,9 +7,54 @@ set(CMAKE_AUTOMOC ON)
 
 option(LOIACONO_ENABLE_DESKTOP_AUDIO "Enable experimental desktop-audio device enumeration" OFF)
 option(LOIACONO_ENABLE_VULKAN_COMPUTE "Enable experimental Vulkan compute backend" OFF)
+set(LOIACONO_QT_PREFIX "" CACHE PATH "Complete Qt 6 installation used for libraries and host tools")
 
 # ── Qt ──
+# Keep Qt libraries and host tools on one version. Prefer an explicit prefix,
+# then the parent JSynth toolchain, then the qtpaths6 selected by PATH.
+if(NOT LOIACONO_QT_PREFIX AND NOT Qt6_DIR)
+    set(_loiacono_parent_qt "${CMAKE_CURRENT_SOURCE_DIR}/../build-local/native/qt5/install-linux")
+    if(EXISTS "${_loiacono_parent_qt}/lib/cmake/Qt6/Qt6Config.cmake")
+        set(LOIACONO_QT_PREFIX "${_loiacono_parent_qt}")
+    else()
+        find_program(LOIACONO_QTPATHS_EXECUTABLE NAMES qtpaths6 qtpaths)
+        if(LOIACONO_QTPATHS_EXECUTABLE)
+            execute_process(
+                COMMAND "${LOIACONO_QTPATHS_EXECUTABLE}" --query QT_INSTALL_PREFIX
+                OUTPUT_VARIABLE LOIACONO_QT_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _loiacono_qtpaths_result
+            )
+            if(NOT _loiacono_qtpaths_result EQUAL 0)
+                set(LOIACONO_QT_PREFIX "")
+            endif()
+        endif()
+    endif()
+endif()
+
+if(LOIACONO_QT_PREFIX)
+    file(REAL_PATH "${LOIACONO_QT_PREFIX}" LOIACONO_QT_PREFIX)
+    set(LOIACONO_QT_PREFIX "${LOIACONO_QT_PREFIX}" CACHE PATH
+        "Complete Qt 6 installation used for libraries and host tools" FORCE)
+    list(PREPEND CMAKE_PREFIX_PATH "${LOIACONO_QT_PREFIX}")
+    execute_process(
+        COMMAND "${LOIACONO_QT_PREFIX}/bin/qtpaths6" --query QT_INSTALL_LIBS
+        OUTPUT_VARIABLE _loiacono_qt_lib_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _loiacono_qt_lib_result
+    )
+    if(_loiacono_qt_lib_result EQUAL 0 AND
+       EXISTS "${_loiacono_qt_lib_dir}/cmake/Qt6/Qt6Config.cmake")
+        set(Qt6_DIR "${_loiacono_qt_lib_dir}/cmake/Qt6" CACHE PATH "Qt 6 package directory" FORCE)
+    elseif(EXISTS "${LOIACONO_QT_PREFIX}/lib/cmake/Qt6/Qt6Config.cmake")
+        set(Qt6_DIR "${LOIACONO_QT_PREFIX}/lib/cmake/Qt6" CACHE PATH "Qt 6 package directory" FORCE)
+    else()
+        message(FATAL_ERROR "LOIACONO_QT_PREFIX does not contain a complete Qt 6 installation: ${LOIACONO_QT_PREFIX}")
+    endif()
+endif()
+
 find_package(Qt6 REQUIRED COMPONENTS Widgets Network OpenGLWidgets)
+message(STATUS "Loiacono Qt ${Qt6_VERSION}: ${Qt6_DIR}")
 find_package(Vulkan REQUIRED)
 
 # ── RtAudio (submodule) ──

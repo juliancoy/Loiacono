@@ -15,7 +15,14 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
-cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$CMAKE_GENERATOR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+qt_cmake_args=()
+if [[ -n "${QT_PREFIX:-}" ]]; then
+  qt_cmake_args+=("-DLOIACONO_QT_PREFIX=$QT_PREFIX")
+fi
+
+cmake --fresh -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$CMAKE_GENERATOR" \
+  -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+  "${qt_cmake_args[@]}"
 cmake --build "$BUILD_DIR"
 
 if [[ "$run_app" == true ]]; then

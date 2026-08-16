@@ -1037,6 +1037,26 @@ LoiaconoRolling::PitchResult LoiaconoRolling::detectRootPitch(
             bestBin = candidateBin;
         }
     }
+
+    // A bright instrument can have a second or third harmonic louder than its
+    // fundamental. Before accepting the strongest candidate, promote a lower
+    // harmonic-series root when that bin has real energy and its complete
+    // harmonic score is competitive. Requiring energy at the lower candidate
+    // avoids incorrectly halving a pure sine wave.
+    const double strongestFreq = binToFreqHz(bestBin);
+    for (int divisor = 4; divisor >= 2; --divisor) {
+        const double rootFreq = strongestFreq / static_cast<double>(divisor);
+        if (rootFreq < minFreq)
+            continue;
+        const double rootBin = freqToBin(rootFreq);
+        const double rootAmplitude = interpolatedSpectrum(spectrum, rootBin) / maxAmp;
+        const double rootScore = scoreCandidateBin(rootBin);
+        if (rootAmplitude >= 0.08 && rootScore >= bestScore * 0.72) {
+            bestBin = rootBin;
+            bestScore = rootScore;
+            break;
+        }
+    }
     
     if (bestScore < 0.05) return result;  // Too quiet/noisy
     

@@ -10,9 +10,15 @@ BUILD_TYPE="${BUILD_TYPE:-Debug}"
 
 mkdir -p "$BUILD_DIR"
 
+qt_cmake_args=()
+if [[ -n "${QT_PREFIX:-}" ]]; then
+  qt_cmake_args+=("-DLOIACONO_QT_PREFIX=$QT_PREFIX")
+fi
+
 # Build with ASAN (Address Sanitizer)
-cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$CMAKE_GENERATOR" \
+cmake --fresh -S "$ROOT_DIR" -B "$BUILD_DIR" -G "$CMAKE_GENERATOR" \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+  "${qt_cmake_args[@]}" \
   -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
 
